@@ -4,7 +4,7 @@ import ast
 import copy
 import ctypes
 import hashlib
-import importlib.util
+import importlib
 import json
 import math
 import os
@@ -23,19 +23,23 @@ from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
 
 APP_NAME = "ClashRoyale"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 REQUIRED_PYTHON = (3, 12, 10)
 DEPENDENCIES = (
     "Pillow>=10.2,<13",
     "numpy>=1.26,<3",
     "opencv-python-headless>=4.9,<5",
 )
-DEPENDENCY_MODULES = ("PIL", "numpy", "cv2")
 MAX_UPDATE_FILE_BYTES = 512 * 1024 * 1024
+MAX_LAUNCHER_FILE_BYTES = 8 * 1024 * 1024
+MAX_JSON_FILE_BYTES = 32 * 1024 * 1024
+MAX_EXPERIENCE_LINE_BYTES = 1024 * 1024
+MAX_EXPERIENCE_ITEMS = 500000
+VENDOR_MARKER_SCHEMA = 2
 FEATURE_COUNT = 10
 ACTION_COUNT = 25
 WAIT_ACTION = 24
@@ -51,6 +55,28 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def strict_json_loads(value: str | bytes) -> Any:
+    def reject_constant(constant: str) -> Any:
+        raise ValueError(f"JSON 包含无效常量：{constant}")
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"JSON 包含重复字段：{key}")
+            result[key] = item
+        return result
+
+    return json.loads(value, parse_constant=reject_constant, object_pairs_hook=reject_duplicates)
+
+
+def read_json_file(path: Path, max_bytes: int = MAX_JSON_FILE_BYTES) -> Any:
+    size = path.stat().st_size
+    if size < 0 or size > max_bytes:
+        raise ValueError(f"JSON 文件大小无效：{path.name}")
+    return strict_json_loads(path.read_text(encoding="utf-8"))
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -70,7 +96,36 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
-    atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n",
+    )
+
+
+def atomic_copy_file(source: Path, target: Path) -> None:
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".copy", dir=str(target.parent))
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        shutil.copy2(source, temp_path)
+        temp_path.chmod(0o600)
+        with temp_path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        if target.exists():
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+        os.replace(temp_path, target)
+    finally:
+        try:
+            temp_path.chmod(0o600)
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def path_is_within(path: Path, root: Path) -> bool:
@@ -81,7 +136,14 @@ def path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def remove_tree(path: Path) -> None:
+def path_is_link(path: Path) -> bool:
+    try:
+        return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+    except OSError:
+        return True
+
+
+def remove_tree(path: Path, strict: bool = False) -> None:
     if not path.exists():
         return
     for child in path.rglob("*"):
@@ -89,11 +151,57 @@ def remove_tree(path: Path) -> None:
             child.chmod(0o700)
         except OSError:
             pass
-    shutil.rmtree(path, ignore_errors=True)
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        if strict:
+            raise
+
+
+def quarantine_non_file(path: Path, temp_root: Path) -> Optional[Path]:
+    exists = path.exists() or path_is_link(path)
+    if not exists or (path.is_file() and not path_is_link(path)):
+        return None
+    temp_root.mkdir(parents=True, exist_ok=True)
+    target = temp_root / f"quarantine-{path.name}-{time.time_ns()}"
+    os.replace(path, target)
+    return target
+
+
+def safe_update_path(value: Any) -> tuple[str, Path]:
+    if not isinstance(value, str):
+        raise ValueError("更新路径必须是字符串")
+    raw = str(value).replace("\\", "/")
+    relative = raw.strip()
+    pure = PurePosixPath(relative)
+    invalid_characters = set('<>:"|?*\0')
+    reserved = {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "conin$",
+        "conout$",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+    if raw != relative or not relative or relative.startswith("/") or pure.is_absolute():
+        raise ValueError(f"拒绝不安全的更新路径：{relative}")
+    if not pure.parts or any(part in {"", ".", ".."} for part in relative.split("/")):
+        raise ValueError(f"拒绝不安全的更新路径：{relative}")
+    for part in pure.parts:
+        if part != part.rstrip(" .") or any(character in invalid_characters for character in part):
+            raise ValueError(f"拒绝 Windows 不支持的更新路径：{relative}")
+        if part.split(".", 1)[0].casefold() in reserved:
+            raise ValueError(f"拒绝 Windows 保留路径：{relative}")
+    normalized = pure.as_posix()
+    return normalized, Path(*pure.parts)
 
 
 def launcher_source_valid(path: Path) -> bool:
     try:
+        if not path.is_file() or path.stat().st_size > MAX_LAUNCHER_FILE_BYTES:
+            return False
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
     except Exception:
@@ -108,6 +216,8 @@ def launcher_source_valid(path: Path) -> bool:
 
 def launcher_version(path: Path) -> tuple[int, ...]:
     try:
+        if not path.is_file() or path.stat().st_size > MAX_LAUNCHER_FILE_BYTES:
+            return (0,)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in tree.body:
             if not isinstance(node, ast.Assign) or len(node.targets) != 1:
@@ -210,6 +320,7 @@ def relocate_to_desktop() -> None:
         return
     try:
         PATHS.ensure_dirs()
+        quarantine_non_file(PATHS.launcher, PATHS.temp)
         current = Path(__file__).resolve()
         target = PATHS.launcher.resolve()
         if current == target:
@@ -227,6 +338,11 @@ def relocate_to_desktop() -> None:
                 shutil.copy2(current, temp_path)
                 if not launcher_source_valid(temp_path):
                     raise RuntimeError("复制后的启动文件未通过结构验证")
+                if target.exists():
+                    try:
+                        target.chmod(0o600)
+                    except OSError:
+                        pass
                 os.replace(temp_path, target)
             finally:
                 try:
@@ -278,7 +394,6 @@ def new_default_config() -> dict[str, Any]:
 
 class AppLog:
     def __init__(self, paths: AppPaths) -> None:
-        paths.logs.mkdir(parents=True, exist_ok=True)
         self.path = paths.logs / "ClashRoyale.log"
         self._lock = threading.Lock()
 
@@ -286,6 +401,7 @@ class AppLog:
         line = f"{utc_now()} [{level}] {message}\n"
         with self._lock:
             try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(line)
             except OSError:
@@ -359,7 +475,7 @@ class ConfigStore:
 
     def _read_raw(self) -> Any:
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
+            return read_json_file(self.path)
         except Exception:
             return None
 
@@ -445,11 +561,20 @@ class ModelStore:
         result["schema"] = 1
         result["app_version"] = APP_VERSION
         generation = result.get("generation", 0)
-        result["generation"] = generation if isinstance(generation, int) and generation >= 0 else 0
+        result["generation"] = (
+            generation if not isinstance(generation, bool) and isinstance(generation, int) and generation >= 0 else 0
+        )
         samples = result.get("training_samples", 0)
-        result["training_samples"] = samples if isinstance(samples, int) and samples >= 0 else 0
-        result.setdefault("created_utc", utc_now())
-        result.setdefault("updated_utc", utc_now())
+        result["training_samples"] = (
+            samples if not isinstance(samples, bool) and isinstance(samples, int) and samples >= 0 else 0
+        )
+        result["weights"] = [
+            [max(-8.0, min(8.0, float(value))) for value in row]
+            for row in result["weights"]
+        ]
+        for key in ("created_utc", "updated_utc"):
+            value = result.get(key)
+            result[key] = value if isinstance(value, str) and value.strip() else utc_now()
         benchmark = result.get("benchmark")
         if not isinstance(benchmark, dict):
             benchmark = {}
@@ -468,7 +593,7 @@ class ModelStore:
     def load(self) -> dict[str, Any]:
         with self._lock:
             try:
-                value = json.loads(self.path.read_text(encoding="utf-8"))
+                value = read_json_file(self.path)
                 normalized = self.normalize(value)
                 if normalized is not None:
                     if normalized != value:
@@ -483,7 +608,7 @@ class ModelStore:
     def repair(self) -> bool:
         try:
             if self.path.exists():
-                value = json.loads(self.path.read_text(encoding="utf-8"))
+                value = read_json_file(self.path)
                 normalized = self.normalize(value)
                 if normalized is not None:
                     if normalized != value:
@@ -505,34 +630,58 @@ class ModelStore:
 class ExperiencePool:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
-    def ensure(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self.path.touch()
-            return True
-        good_lines: list[str] = []
-        damaged = False
-        try:
-            with self.path.open("r", encoding="utf-8") as handle:
-                for line in handle:
+    def _lines(self) -> Any:
+        with self.path.open("rb") as handle:
+            while True:
+                raw = handle.readline(MAX_EXPERIENCE_LINE_BYTES + 1)
+                if not raw:
+                    return
+                if len(raw) > MAX_EXPERIENCE_LINE_BYTES and not raw.endswith(b"\n"):
+                    while raw and not raw.endswith(b"\n"):
+                        raw = handle.readline(MAX_EXPERIENCE_LINE_BYTES + 1)
+                    yield None
+                    continue
+                try:
+                    yield raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    yield None
+
+    def ensure(self, max_items: int = MAX_EXPERIENCE_ITEMS) -> bool:
+        max_items = max(1, min(MAX_EXPERIENCE_ITEMS, int(max_items)))
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.path.exists():
+                self.path.touch()
+                return True
+            good_lines: deque[str] = deque(maxlen=max_items)
+            damaged = False
+            valid_count = 0
+            try:
+                for line in self._lines():
+                    if line is None:
+                        damaged = True
+                        continue
                     stripped = line.strip()
                     if not stripped:
                         continue
                     try:
-                        item = json.loads(stripped)
+                        item = strict_json_loads(stripped)
                         if self.valid_item(item):
+                            valid_count += 1
                             good_lines.append(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
                         else:
                             damaged = True
                     except Exception:
                         damaged = True
-        except Exception:
-            damaged = True
-        if damaged:
-            atomic_write_text(self.path, "".join(line + "\n" for line in good_lines))
-        return damaged
+            except OSError:
+                damaged = True
+            if valid_count > max_items:
+                damaged = True
+            if damaged:
+                atomic_write_text(self.path, "".join(line + "\n" for line in good_lines))
+            return damaged
 
     @staticmethod
     def valid_item(item: Any) -> bool:
@@ -559,6 +708,9 @@ class ExperiencePool:
         )
 
     def append(self, features: list[float], action: int, reward: float, meta: Optional[dict[str, Any]] = None) -> None:
+        candidate = {"features": features, "action": action, "reward": reward}
+        if not self.valid_item(candidate):
+            raise ValueError("拒绝写入无效经验")
         item = {
             "ts": utc_now(),
             "features": [round(float(v), 6) for v in features],
@@ -566,7 +718,7 @@ class ExperiencePool:
             "reward": round(float(max(-2.0, min(2.0, reward))), 6),
             "meta": meta or {},
         }
-        line = json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+        line = json.dumps(item, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
@@ -583,7 +735,7 @@ class ExperiencePool:
                 with self.path.open("r", encoding="utf-8") as handle:
                     for line in handle:
                         try:
-                            item = json.loads(line)
+                            item = strict_json_loads(line)
                         except Exception:
                             continue
                         if self.valid_item(item):
@@ -592,46 +744,94 @@ class ExperiencePool:
                 return []
         return list(result)
 
-    def compact(self, max_items: int) -> None:
-        items = self.load(max_items + 1)
-        if len(items) <= max_items:
-            return
-        kept = items[-max_items:]
-        atomic_write_text(
-            self.path,
-            "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n" for item in kept),
-        )
+    def compact(self, max_items: int) -> bool:
+        max_items = max(1, min(MAX_EXPERIENCE_ITEMS, int(max_items)))
+        with self._lock:
+            items = self.load(max_items + 1)
+            if len(items) <= max_items:
+                return False
+            kept = items[-max_items:]
+            atomic_write_text(
+                self.path,
+                "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n" for item in kept),
+            )
+            return True
 
 
 class DependencyManager:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
 
-    def _marker_valid(self) -> bool:
+    @staticmethod
+    def _vendor_digest(root: Path) -> dict[str, Any]:
+        digest = hashlib.sha256()
+        file_count = 0
+        total_bytes = 0
+        marker = root / ".installed.json"
+        for path in root.rglob("*"):
+            if path_is_link(path):
+                raise RuntimeError(f"依赖目录包含不安全链接：{path.name}")
+        candidates = sorted(
+            (
+                path
+                for path in root.rglob("*")
+                if path.is_file()
+                and path != marker
+                and "__pycache__" not in path.parts
+            ),
+            key=lambda path: path.relative_to(root).as_posix().casefold(),
+        )
+        for path in candidates:
+            if not path_is_within(path, root):
+                raise RuntimeError(f"依赖目录包含不安全链接：{path.name}")
+            relative = path.relative_to(root).as_posix()
+            size = path.stat().st_size
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(size).encode("ascii"))
+            digest.update(b"\0")
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+            file_count += 1
+            total_bytes += size
+        return {
+            "sha256": digest.hexdigest(),
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+        }
+
+    def _read_marker(self) -> Optional[dict[str, Any]]:
         try:
-            marker = json.loads(self.paths.dependency_marker.read_text(encoding="utf-8"))
-            return (
-                marker.get("python") == ".".join(map(str, REQUIRED_PYTHON))
+            marker = read_json_file(self.paths.dependency_marker, 4 * 1024 * 1024)
+            if not isinstance(marker, dict):
+                return None
+            valid = (
+                marker.get("schema") == VENDOR_MARKER_SCHEMA
+                and marker.get("python") == ".".join(map(str, REQUIRED_PYTHON))
                 and marker.get("requirements") == list(DEPENDENCIES)
+                and isinstance(marker.get("versions"), dict)
+                and isinstance(marker.get("inventory"), dict)
             )
+            return marker if valid else None
+        except Exception:
+            return None
+
+    def available(self, deep_check: bool = False) -> bool:
+        marker = self._read_marker()
+        if marker is None or not self.paths.vendor.is_dir():
+            return False
+        try:
+            versions = self._validate_staging(self.paths.vendor)
+            expected_versions = {str(key): str(value) for key, value in marker["versions"].items()}
+            if versions != expected_versions:
+                return False
+            if deep_check and self._vendor_digest(self.paths.vendor) != marker["inventory"]:
+                return False
+            return True
         except Exception:
             return False
-
-    def available(self) -> bool:
-        if not self._marker_valid():
-            return False
-        add_vendor_path()
-        importlib.invalidate_caches()
-        for name in DEPENDENCY_MODULES:
-            try:
-                spec = importlib.util.find_spec(name)
-                if spec is None or not spec.origin:
-                    return False
-                if not path_is_within(Path(spec.origin), self.paths.vendor):
-                    return False
-            except Exception:
-                return False
-        return True
 
     @staticmethod
     def _validate_staging(staging: Path) -> dict[str, str]:
@@ -650,7 +850,7 @@ for name, module in mods.items():
 print(json.dumps({name: str(getattr(module, "__version__", "unknown")) for name, module in mods.items()}))
 """
         result = subprocess.run(
-            [sys.executable, "-c", code, str(staging)],
+            [sys.executable, "-I", "-S", "-B", "-c", code, str(staging)],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -661,15 +861,20 @@ print(json.dumps({name: str(getattr(module, "__version__", "unknown")) for name,
         if result.returncode != 0:
             raise RuntimeError("依赖导入验证失败：" + (result.stderr or result.stdout)[-800:])
         try:
-            versions = json.loads(result.stdout.strip().splitlines()[-1])
+            versions = strict_json_loads(result.stdout.strip().splitlines()[-1])
         except Exception as exc:
             raise RuntimeError("依赖版本信息无效") from exc
         if not isinstance(versions, dict):
             raise RuntimeError("依赖版本信息无效")
         return {str(key): str(value) for key, value in versions.items()}
 
-    def install(self, progress: Callable[[str], None], stop: threading.Event) -> None:
-        if self.available():
+    def install(
+        self,
+        progress: Callable[[str], None],
+        stop: threading.Event,
+        deep_check: bool = False,
+    ) -> None:
+        if self.available(deep_check=deep_check):
             progress("本地依赖完整")
             return
         if stop.is_set():
@@ -702,6 +907,7 @@ print(json.dumps({name: str(getattr(module, "__version__", "unknown")) for name,
             "-m",
             "pip",
             "install",
+            "--isolated",
             "--disable-pip-version-check",
             "--no-warn-script-location",
             "--no-cache-dir",
@@ -717,14 +923,15 @@ print(json.dumps({name: str(getattr(module, "__version__", "unknown")) for name,
         install_env["TEMP"] = str(self.paths.temp)
         output_path = self.paths.temp / f"pip-install-{os.getpid()}-{time.time_ns()}.log"
         output_handle = output_path.open("w+b")
-        process = subprocess.Popen(
-            command,
-            stdout=output_handle,
-            stderr=subprocess.STDOUT,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env=install_env,
-        )
+        process: Any = None
         try:
+            process = subprocess.Popen(
+                command,
+                stdout=output_handle,
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=install_env,
+            )
             last_notice = 0.0
             while process.poll() is None:
                 if stop.wait(0.20):
@@ -742,36 +949,45 @@ print(json.dumps({name: str(getattr(module, "__version__", "unknown")) for name,
             output = output_handle.read().decode("utf-8", errors="replace")
             if process.returncode != 0:
                 raise RuntimeError("依赖下载失败：" + (output[-1200:] if output else "pip exited with error"))
+            if stop.is_set():
+                raise RuntimeError("依赖安装已取消")
 
             progress("验证依赖完整性…")
             versions = self._validate_staging(staging)
+            inventory = self._vendor_digest(staging)
             atomic_write_json(
                 staging / ".installed.json",
                 {
-                    "schema": 1,
+                    "schema": VENDOR_MARKER_SCHEMA,
                     "installed_utc": utc_now(),
                     "python": ".".join(map(str, REQUIRED_PYTHON)),
                     "requirements": list(DEPENDENCIES),
                     "versions": versions,
+                    "inventory": inventory,
                 },
             )
 
+            old_moved = False
             if self.paths.vendor.exists():
-                remove_tree(old_vendor)
+                remove_tree(old_vendor, strict=True)
                 os.replace(self.paths.vendor, old_vendor)
+                old_moved = True
             try:
                 os.replace(staging, self.paths.vendor)
+                importlib.invalidate_caches()
+                if not self.available(deep_check=True):
+                    raise RuntimeError("依赖已安装，但完整性复检失败")
             except Exception:
-                if old_vendor.exists() and not self.paths.vendor.exists():
+                if self.paths.vendor.exists():
+                    remove_tree(self.paths.vendor, strict=True)
+                if old_moved and old_vendor.exists() and not self.paths.vendor.exists():
                     os.replace(old_vendor, self.paths.vendor)
+                    importlib.invalidate_caches()
                 raise
             remove_tree(old_vendor)
-            importlib.invalidate_caches()
-            if not self.available():
-                raise RuntimeError("依赖已安装，但完整性复检失败")
             progress("依赖安装完成")
         finally:
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 process.kill()
             output_handle.close()
             try:
@@ -805,7 +1021,7 @@ class RemoteUpdater:
             raw_manifest = response.read(2 * 1024 * 1024 + 1)
         if len(raw_manifest) > 2 * 1024 * 1024:
             raise ValueError("更新清单过大")
-        manifest = json.loads(raw_manifest.decode("utf-8"))
+        manifest = strict_json_loads(raw_manifest.decode("utf-8"))
         if not isinstance(manifest, dict):
             raise ValueError("更新清单格式错误")
         files = manifest.get("files", [])
@@ -813,25 +1029,19 @@ class RemoteUpdater:
             raise ValueError("更新清单格式错误")
 
         seen: set[str] = set()
-        changed = 0
+        pending: list[dict[str, Any]] = []
         for index, item in enumerate(files, 1):
             if stop.is_set():
-                break
+                raise RuntimeError("更新已取消")
             if not isinstance(item, dict):
                 raise ValueError("更新项格式错误")
-            relative = str(item.get("path", "")).replace("\\", "/").strip()
+            relative, relative_path = safe_update_path(item.get("path", ""))
             expected = str(item.get("sha256", "")).lower().strip()
             url = str(item.get("url", "")).strip()
             declared_size = item.get("size")
-            relative_path = Path(relative)
-            seen_key = relative_path.as_posix().casefold()
-            if (
-                not relative
-                or relative_path.is_absolute()
-                or ".." in relative_path.parts
-                or seen_key in seen
-            ):
-                raise ValueError(f"拒绝不安全或重复的更新路径：{relative}")
+            seen_key = relative.casefold()
+            if seen_key in seen:
+                raise ValueError(f"拒绝重复的更新路径：{relative}")
             seen.add(seen_key)
             if relative_path.parts and relative_path.parts[0].casefold() in {"backup", "logs", "temp"}:
                 raise ValueError(f"拒绝更新受保护目录：{relative}")
@@ -847,27 +1057,60 @@ class RemoteUpdater:
                 if declared_size < 0 or declared_size > MAX_UPDATE_FILE_BYTES:
                     raise ValueError(f"更新项过大：{relative}")
 
-            target = (self.paths.root / relative_path).resolve()
+            unresolved_target = self.paths.root / relative_path
+            cursor = self.paths.root
+            for part in relative_path.parts:
+                cursor /= part
+                if cursor.exists() and path_is_link(cursor):
+                    raise ValueError(f"拒绝通过链接更新文件：{relative}")
+            target = unresolved_target.resolve()
             if not path_is_within(target, self.paths.root) or target == self.paths.root.resolve():
                 raise ValueError(f"更新目标越界：{relative}")
+            if target.exists() and not target.is_file():
+                raise ValueError(f"更新目标不是普通文件：{relative}")
+            file_limit = MAX_LAUNCHER_FILE_BYTES if target == self.paths.launcher else MAX_UPDATE_FILE_BYTES
+            if declared_size is not None and declared_size > file_limit:
+                raise ValueError(f"更新项过大：{relative}")
             if target.exists() and target.is_file() and sha256_file(target) == expected:
                 continue
+            pending.append(
+                {
+                    "manifest_index": index,
+                    "relative": relative,
+                    "expected": expected,
+                    "url": url,
+                    "declared_size": declared_size,
+                    "file_limit": file_limit,
+                    "target": target,
+                }
+            )
 
-            progress(f"下载更新 {index}/{len(files)}：{relative}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            fd, temp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".download", dir=str(target.parent))
-            os.close(fd)
-            temp_path = Path(temp_name)
-            try:
+        if not pending:
+            return 0
+
+        staging = self.paths.temp / f"remote-update-{os.getpid()}-{time.time_ns()}"
+        downloads = staging / "downloads"
+        rollback = staging / "rollback"
+        remove_tree(staging, strict=True)
+        downloads.mkdir(parents=True, exist_ok=True)
+        committed: list[tuple[Path, Path, bool]] = []
+        try:
+            for position, plan in enumerate(pending):
+                if stop.is_set():
+                    raise RuntimeError("更新已取消")
+                relative = str(plan["relative"])
+                progress(f"下载更新 {plan['manifest_index']}/{len(files)}：{relative}")
+                temp_path = downloads / f"{position:04d}.download"
+                file_limit = int(plan["file_limit"])
                 total = 0
-                with self._open_https(url, 45) as response, temp_path.open("wb") as handle:
+                with self._open_https(str(plan["url"]), 45) as response, temp_path.open("wb") as handle:
                     content_length = response.headers.get("Content-Length")
                     if content_length:
                         try:
                             remote_size = int(content_length)
                         except ValueError:
                             remote_size = -1
-                        if remote_size > MAX_UPDATE_FILE_BYTES:
+                        if remote_size > file_limit:
                             raise RuntimeError(f"更新文件过大：{relative}")
                     while True:
                         chunk = response.read(1024 * 256)
@@ -876,25 +1119,53 @@ class RemoteUpdater:
                         if stop.is_set():
                             raise RuntimeError("更新已取消")
                         total += len(chunk)
-                        if total > MAX_UPDATE_FILE_BYTES:
+                        if total > file_limit:
                             raise RuntimeError(f"更新文件过大：{relative}")
                         handle.write(chunk)
                     handle.flush()
                     os.fsync(handle.fileno())
+                declared_size = plan["declared_size"]
                 if declared_size is not None and total != declared_size:
                     raise RuntimeError(f"更新文件大小校验失败：{relative}")
-                if sha256_file(temp_path) != expected:
+                if sha256_file(temp_path) != plan["expected"]:
                     raise RuntimeError(f"更新文件校验失败：{relative}")
+                target = plan["target"]
                 if target == self.paths.launcher and not launcher_source_valid(temp_path):
                     raise RuntimeError("远程启动文件未通过结构验证")
-                os.replace(temp_path, target)
-                changed += 1
-            finally:
+
+            if stop.is_set():
+                raise RuntimeError("更新已取消")
+            progress("原子应用已验证的更新…")
+            rollback.mkdir(parents=True, exist_ok=True)
+            for position, plan in enumerate(pending):
+                target = plan["target"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                backup = rollback / f"{position:04d}.backup"
+                had_original = target.exists()
+                if had_original:
+                    try:
+                        target.chmod(0o600)
+                    except OSError:
+                        pass
+                    os.replace(target, backup)
+                committed.append((target, backup, had_original))
+                os.replace(downloads / f"{position:04d}.download", target)
+            return len(pending)
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            for target, backup, had_original in reversed(committed):
                 try:
-                    temp_path.unlink()
-                except FileNotFoundError:
-                    pass
-        return changed
+                    if target.exists():
+                        target.unlink()
+                    if had_original and backup.exists():
+                        os.replace(backup, target)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{target.name}: {rollback_exc}")
+            if rollback_errors:
+                raise RuntimeError("更新失败且回滚不完整：" + "；".join(rollback_errors)) from exc
+            raise
+        finally:
+            remove_tree(staging)
 
 
 class IntegrityService:
@@ -932,7 +1203,7 @@ class IntegrityService:
 
     def _previous_hash(self, relative: str) -> Optional[str]:
         try:
-            records = json.loads(self.paths.checksums.read_text(encoding="utf-8"))
+            records = read_json_file(self.paths.checksums, 4 * 1024 * 1024)
             value = records["files"][relative]["sha256"]
             if isinstance(value, str) and len(value) == 64:
                 return value.lower()
@@ -944,13 +1215,20 @@ class IntegrityService:
         launcher = self.paths.launcher
         backup = self.paths.launcher_backup
         backup.parent.mkdir(parents=True, exist_ok=True)
+        quarantined_launcher = quarantine_non_file(launcher, self.paths.temp)
+        quarantine_non_file(backup, self.paths.temp)
         if not launcher.exists():
+            if backup.is_file() and launcher_source_valid(backup):
+                atomic_copy_file(backup, launcher)
+                if quarantined_launcher is not None:
+                    return "已隔离异常启动路径，并从可信备份补全 ClashRoyale.py"
+                return "已从可信备份补全 ClashRoyale.py"
             source = Path(__file__).resolve()
             if launcher_source_valid(source):
-                shutil.copy2(source, launcher)
-                shutil.copy2(source, backup)
+                atomic_copy_file(source, launcher)
+                atomic_copy_file(source, backup)
                 return "已补全 ClashRoyale.py 及其备份"
-            return None
+            raise RuntimeError("ClashRoyale.py 缺失，且没有可用备份")
 
         current_valid = launcher_source_valid(launcher)
         backup_valid = backup.exists() and launcher_source_valid(backup)
@@ -960,22 +1238,24 @@ class IntegrityService:
 
         if accept_current and current_valid:
             if not backup_valid or backup_hash != current_hash:
-                shutil.copy2(launcher, backup)
+                atomic_copy_file(launcher, backup)
                 return "已刷新启动文件备份"
             return None
         if current_valid and backup_valid and launcher_version(launcher) > launcher_version(backup):
-            shutil.copy2(launcher, backup)
+            atomic_copy_file(launcher, backup)
             return "已接受较新版本并刷新启动文件备份"
         if expected and current_hash != expected and backup_valid and backup_hash == expected:
-            shutil.copy2(backup, launcher)
+            atomic_copy_file(backup, launcher)
             return "已从可信备份恢复 ClashRoyale.py"
+        if expected and current_hash != expected:
+            raise RuntimeError("ClashRoyale.py 与完整性记录不一致，且没有匹配的可信备份")
         if not current_valid and backup_valid:
-            shutil.copy2(backup, launcher)
+            atomic_copy_file(backup, launcher)
             return "已替换损坏的 ClashRoyale.py"
         if not current_valid:
             raise RuntimeError("ClashRoyale.py 结构损坏，且没有可用备份")
         if not backup_valid or backup_hash != current_hash:
-            shutil.copy2(launcher, backup)
+            atomic_copy_file(launcher, backup)
             return "已刷新启动文件备份"
         return None
 
@@ -1025,10 +1305,11 @@ class IntegrityService:
             repaired.append("model/policy.json")
 
         progress("检查经验池…")
-        if self.pool.ensure():
+        max_experiences = int(config.get("max_experiences", 50000))
+        if self.pool.ensure(max_experiences):
             repaired.append("data/experiences.jsonl")
 
-        self.dependencies.install(progress, stop)
+        self.dependencies.install(progress, stop, deep_check=True)
         if stop.is_set():
             return {"repaired": repaired, "updated": 0}
 
@@ -1041,11 +1322,12 @@ class IntegrityService:
                 repaired.append("远程配置已规范化")
             if self.model_store.repair():
                 repaired.append("远程模型无效，已重建")
-            if self.pool.ensure():
+            max_experiences = int(config.get("max_experiences", 50000))
+            if self.pool.ensure(max_experiences):
                 repaired.append("远程经验池无效，已修复")
             if not launcher_source_valid(self.paths.launcher):
                 raise RuntimeError("远程更新后的 ClashRoyale.py 未通过结构验证")
-            self.dependencies.install(progress, stop)
+            self.dependencies.install(progress, stop, deep_check=True)
 
         backup_result = self.repair_launcher_backup(accept_current=bool(updated))
         if backup_result and backup_result not in repaired:
@@ -1063,16 +1345,58 @@ class IntegrityService:
             raise RuntimeError("；".join(errors))
         config, _ = self.config_store.repair()
         self.model_store.repair()
-        self.pool.ensure()
-        self.dependencies.install(progress, stop)
+        self.pool.ensure(int(config.get("max_experiences", 50000)))
+        self.dependencies.install(progress, stop, deep_check=False)
         return config
 
 
 class WindowsControl:
     user32 = ctypes.windll.user32 if os.name == "nt" else None
+    enum_callback_type: Any = None
+    api_ready = False
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        self._configure_api()
+
+    @classmethod
+    def _configure_api(cls) -> None:
+        if os.name != "nt" or cls.api_ready:
+            return
+        user32 = cls.user32
+        assert user32 is not None
+        cls.enum_callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetClientRect.restype = wintypes.BOOL
+        user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+        user32.ClientToScreen.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        user32.SetCursorPos.restype = wintypes.BOOL
+        user32.mouse_event.argtypes = [
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_size_t,
+        ]
+        user32.mouse_event.restype = None
+        user32.EnumWindows.argtypes = [cls.enum_callback_type, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        cls.api_ready = True
 
     @staticmethod
     def _text(hwnd: int) -> str:
@@ -1091,7 +1415,8 @@ class WindowsControl:
         assert user32 is not None
         keywords = [str(value).casefold() for value in self.config.get("window_title_keywords", [])]
         candidates: list[tuple[int, int, str]] = []
-        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        callback_type = self.enum_callback_type
+        assert callback_type is not None
 
         def enum_callback(hwnd: int, _lparam: int) -> bool:
             if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
@@ -1171,7 +1496,8 @@ class WindowsControl:
             subprocess.Popen([str(launcher)], close_fds=True)
         deadline = time.monotonic() + 45.0
         while time.monotonic() < deadline and not stop.is_set():
-            time.sleep(0.5)
+            if stop.wait(0.5):
+                return None
             hwnd = self.find_game_window()
             if hwnd:
                 return hwnd
@@ -1475,14 +1801,26 @@ class Policy:
         scored.sort(reverse=True)
         return scored[0][1]
 
-    def execute(self, control: WindowsControl, hwnd: int, action: int) -> None:
-        if action == WAIT_ACTION:
+    def execute(
+        self,
+        control: WindowsControl,
+        hwnd: int,
+        action: int,
+        stop: Optional[threading.Event] = None,
+    ) -> None:
+        if action == WAIT_ACTION or (stop is not None and stop.is_set()):
             return
         card = action // 6
         target = action % 6
         control.click_normalized(hwnd, self.CARD_X[card], self.CARD_Y)
-        time.sleep(0.08)
+        if stop is not None:
+            if stop.wait(0.08):
+                return
+        else:
+            time.sleep(0.08)
         tx, ty = self.TARGETS[target]
+        if stop is not None and stop.is_set():
+            return
         control.click_normalized(hwnd, tx, ty)
 
 
@@ -1497,23 +1835,30 @@ class Trainer:
         samples = self.pool.load(max_experiences)
         model = self.model_store.load()
         if not samples:
+            if stop.is_set():
+                return {"samples": 0, "generation": model.get("generation", 0), "cancelled": True}
             progress("经验池为空：保留当前模型")
             model["updated_utc"] = utc_now()
             model["benchmark"]["status"] = "unverified"
             self.model_store.save(model)
-            return {"samples": 0, "generation": model.get("generation", 0)}
+            return {"samples": 0, "generation": model.get("generation", 0), "cancelled": False}
 
         rng = random.Random(2026 + int(model.get("generation", 0)))
         weights = [[float(value) for value in row] for row in model["weights"]]
         epochs = max(1, min(50, int(self.config.get("training_epochs", 5))))
         learning_rate = max(0.0001, min(0.2, float(self.config.get("training_learning_rate", 0.012))))
 
+        cancelled = False
         for epoch in range(epochs):
             if stop.is_set():
+                cancelled = True
                 break
             rng.shuffle(samples)
             total_abs_reward = 0.0
-            for item in samples:
+            for sample_index, item in enumerate(samples):
+                if sample_index % 128 == 0 and stop.is_set():
+                    cancelled = True
+                    break
                 features = [max(-2.0, min(2.0, float(value))) for value in item["features"]]
                 action = int(item["action"])
                 reward = max(-1.0, min(1.0, float(item["reward"])))
@@ -1524,7 +1869,17 @@ class Trainer:
                     weights[action][index] += learning_rate * error * features[index]
                     weights[action][index] *= 0.99998
                     weights[action][index] = max(-8.0, min(8.0, weights[action][index]))
+            if cancelled:
+                break
             progress(f"模型训练 {epoch + 1}/{epochs}，有效奖励 {total_abs_reward:.2f}")
+
+        if cancelled or stop.is_set():
+            progress("升级已取消，模型保持不变")
+            return {
+                "samples": 0,
+                "generation": model.get("generation", 0),
+                "cancelled": True,
+            }
 
         model["weights"] = weights
         model["generation"] = int(model.get("generation", 0)) + 1
@@ -1532,11 +1887,14 @@ class Trainer:
         model["training_samples"] = int(model.get("training_samples", 0)) + len(samples)
         model["benchmark"] = {
             "status": "unverified",
-            "note": "Training completed, but professional-level superiority requires external controlled benchmarking.",
+            "note": (
+                "Training completed, but professional-level superiority requires "
+                "external controlled benchmarking."
+            ),
         }
         self.model_store.save(model)
         self.pool.compact(max_experiences)
-        return {"samples": len(samples), "generation": model["generation"]}
+        return {"samples": len(samples), "generation": model["generation"], "cancelled": False}
 
 
 class GameAI:
@@ -1624,7 +1982,7 @@ class GameAI:
                 low_confidence_frames = 0
                 action = self.policy.choose(analysis)
                 if not stop.is_set():
-                    self.policy.execute(self.control, hwnd, action)
+                    self.policy.execute(self.control, hwnd, action, stop)
 
             if not queued:
                 previous_analysis = analysis
@@ -1686,6 +2044,7 @@ class ClashRoyaleApp:
         self.mode_token = 0
         self.mode_stop = threading.Event()
         self.events: queue.Queue[tuple[str, int, Any]] = queue.Queue()
+        self.active_workers = 0
 
         self.root = tk.Tk()
         self.root.title(f"Clash Royale 控制台 {APP_VERSION}")
@@ -1772,6 +2131,8 @@ class ClashRoyaleApp:
         tk.Label(
             status_panel,
             textvariable=self.detail_var,
+            wraplength=840,
+            justify="center",
             bg="#111827",
             fg="#93a4ba",
             font=("Microsoft YaHei UI", 9),
@@ -1785,6 +2146,14 @@ class ClashRoyaleApp:
         try:
             while True:
                 event, token, payload = self.events.get_nowait()
+                if event == "worker_finished":
+                    self.active_workers = max(0, self.active_workers - 1)
+                    if self.mode == "home" and self.active_workers == 0:
+                        for button in self.buttons:
+                            button.configure(state="normal")
+                        self.status_var.set("选择模式")
+                        self.detail_var.set("ESC 可随时退出当前模式")
+                    continue
                 if event == "escape":
                     if self.mode != "home":
                         self.exit_mode()
@@ -1800,12 +2169,13 @@ class ClashRoyaleApp:
                     self.status_var.set("发生错误")
                     self.detail_var.set(str(payload))
                     LOG.write("ERROR", str(payload))
+                    self.root.after(1400, lambda t=token: self._auto_home(t))
         except queue.Empty:
             pass
         self.root.after(80, self.process_events)
 
     def _auto_home(self, token: int) -> None:
-        if token == self.mode_token and self.mode in {"file", "upgrade"}:
+        if token == self.mode_token and self.mode != "home":
             self.exit_mode()
 
     def set_mode(self, mode: str, title: str, status: str) -> int:
@@ -1825,13 +2195,22 @@ class ClashRoyaleApp:
         self.events.put((event, token, payload))
 
     def worker(self, token: int, function: Callable[[], None]) -> None:
+        self.active_workers += 1
+
         def run() -> None:
             try:
                 function()
             except Exception as exc:
                 LOG.exception(str(exc))
                 self.post("error", token, str(exc))
-        threading.Thread(target=run, name=f"Mode-{token}", daemon=True).start()
+            finally:
+                self.post("worker_finished", token, None)
+
+        try:
+            threading.Thread(target=run, name=f"Mode-{token}", daemon=True).start()
+        except Exception:
+            self.active_workers = max(0, self.active_workers - 1)
+            raise
 
     def start_file_mode(self) -> None:
         token = self.set_mode("file", "文件模式", "正在检查完整性")
@@ -1870,6 +2249,8 @@ class ClashRoyaleApp:
                 return
             trainer = Trainer(ModelStore(self.paths.model), ExperiencePool(self.paths.experiences), config)
             result = trainer.run(lambda text: self.post("status", token, text), self.mode_stop)
+            if self.mode_stop.is_set() or result.get("cancelled"):
+                return
             self.post(
                 "done",
                 token,
@@ -1898,9 +2279,11 @@ class ClashRoyaleApp:
         self.mode = "home"
         self.title_var.set("Clash Royale")
         self.status_var.set("选择模式")
-        self.detail_var.set("ESC 可随时退出当前模式")
+        self.detail_var.set(
+            "后台任务正在安全停止…" if self.active_workers else "ESC 可随时退出当前模式"
+        )
         for button in self.buttons:
-            button.configure(state="normal")
+            button.configure(state="disabled" if self.active_workers else "normal")
         try:
             self.root.deiconify()
             self.root.lift()
@@ -1919,10 +2302,13 @@ class ClashRoyaleApp:
 
 def main() -> None:
     enable_dpi_awareness()
-    relocate_to_desktop()
-    PATHS.ensure_dirs()
-    add_vendor_path()
     try:
+        errors = IntegrityService.platform_errors()
+        if errors:
+            raise RuntimeError("；".join(errors))
+        relocate_to_desktop()
+        PATHS.ensure_dirs()
+        add_vendor_path()
         ClashRoyaleApp().run()
     except Exception as exc:
         LOG.exception(str(exc))
