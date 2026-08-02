@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
+import copy
 import ctypes
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -16,20 +19,23 @@ import threading
 import time
 import traceback
 import urllib.request
+from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional
 
 APP_NAME = "ClashRoyale"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 REQUIRED_PYTHON = (3, 12, 10)
 DEPENDENCIES = (
     "Pillow>=10.2,<13",
     "numpy>=1.26,<3",
     "opencv-python-headless>=4.9,<5",
 )
+DEPENDENCY_MODULES = ("PIL", "numpy", "cv2")
+MAX_UPDATE_FILE_BYTES = 512 * 1024 * 1024
 FEATURE_COUNT = 10
 ACTION_COUNT = 25
 WAIT_ACTION = 24
@@ -67,6 +73,57 @@ def atomic_write_json(path: Path, value: Any) -> None:
     atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def remove_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    for child in path.rglob("*"):
+        try:
+            child.chmod(0o700)
+        except OSError:
+            pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def launcher_source_valid(path: Path) -> bool:
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+    except Exception:
+        return False
+    top_level_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    return {"main", "ClashRoyaleApp", "IntegrityService", "GameAI"}.issubset(top_level_names)
+
+
+def launcher_version(path: Path) -> tuple[int, ...]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id == "APP_VERSION":
+                value = ast.literal_eval(node.value)
+                if isinstance(value, str):
+                    parts = tuple(int(part) for part in value.split("."))
+                    if parts:
+                        return parts
+    except Exception:
+        pass
+    return (0,)
+
+
 def desktop_path() -> Path:
     if os.name == "nt":
         try:
@@ -82,15 +139,36 @@ def desktop_path() -> Path:
     return candidate if candidate.exists() else Path.home()
 
 
+def enable_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 @dataclass(frozen=True)
 class AppPaths:
     root: Path
     launcher: Path
+    launcher_backup: Path
     config: Path
     model: Path
     experiences: Path
     checksums: Path
     vendor: Path
+    dependency_marker: Path
     logs: Path
     temp: Path
 
@@ -100,17 +178,27 @@ class AppPaths:
         return cls(
             root=root,
             launcher=root / "ClashRoyale.py",
+            launcher_backup=root / "backup" / "ClashRoyale.py",
             config=root / "config.json",
             model=root / "model" / "policy.json",
             experiences=root / "data" / "experiences.jsonl",
             checksums=root / "checksums.json",
             vendor=root / "vendor",
+            dependency_marker=root / "vendor" / ".installed.json",
             logs=root / "logs",
             temp=root / "temp",
         )
 
     def ensure_dirs(self) -> None:
-        for path in (self.root, self.model.parent, self.experiences.parent, self.vendor, self.logs, self.temp):
+        for path in (
+            self.root,
+            self.launcher_backup.parent,
+            self.model.parent,
+            self.experiences.parent,
+            self.vendor,
+            self.logs,
+            self.temp,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -126,7 +214,25 @@ def relocate_to_desktop() -> None:
         target = PATHS.launcher.resolve()
         if current == target:
             return
-        shutil.copy2(current, target)
+        use_existing = (
+            target.exists()
+            and launcher_source_valid(target)
+            and launcher_version(target) >= launcher_version(current)
+        )
+        if not use_existing:
+            fd, temp_name = tempfile.mkstemp(prefix="ClashRoyale.", suffix=".py.tmp", dir=str(PATHS.root))
+            os.close(fd)
+            temp_path = Path(temp_name)
+            try:
+                shutil.copy2(current, temp_path)
+                if not launcher_source_valid(temp_path):
+                    raise RuntimeError("复制后的启动文件未通过结构验证")
+                os.replace(temp_path, target)
+            finally:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
         subprocess.Popen([sys.executable, str(target)], cwd=str(PATHS.root), close_fds=True)
         raise SystemExit(0)
     except SystemExit:
@@ -158,11 +264,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "decision_interval_seconds": 1.25,
     "exploration": 0.04,
     "auto_launch_game": True,
-    "auto_queue_battle": False,
+    "auto_queue_battle": True,
+    "lobby_click_cooldown_seconds": 8.0,
     "training_epochs": 5,
     "training_learning_rate": 0.012,
     "max_experiences": 50000,
 }
+
+
+def new_default_config() -> dict[str, Any]:
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 class AppLog:
@@ -191,33 +302,79 @@ class ConfigStore:
     def __init__(self, path: Path) -> None:
         self.path = path
 
+    @staticmethod
+    def _normalize(value: Any) -> dict[str, Any]:
+        defaults = new_default_config()
+        if not isinstance(value, dict):
+            return defaults
+
+        result = new_default_config()
+        result["schema"] = int(defaults["schema"])
+        result["app_version"] = APP_VERSION
+
+        manifest_url = value.get("update_manifest_url", defaults["update_manifest_url"])
+        if isinstance(manifest_url, str):
+            manifest_url = manifest_url.strip()
+            if not manifest_url or manifest_url.lower().startswith("https://"):
+                result["update_manifest_url"] = manifest_url
+
+        for key in ("window_title_keywords", "launcher_name_keywords"):
+            raw = value.get(key)
+            if isinstance(raw, list):
+                cleaned = [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
+                if cleaned:
+                    result[key] = cleaned[:32]
+
+        costs = value.get("card_costs")
+        if isinstance(costs, list) and len(costs) == 4:
+            normalized_costs: list[int] = []
+            for item in costs:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    normalized_costs = []
+                    break
+                normalized_costs.append(max(1, min(10, item)))
+            if len(normalized_costs) == 4:
+                result["card_costs"] = normalized_costs
+
+        numeric_limits: dict[str, tuple[float, float, type]] = {
+            "decision_interval_seconds": (0.55, 3.0, float),
+            "exploration": (0.0, 0.35, float),
+            "lobby_click_cooldown_seconds": (4.0, 30.0, float),
+            "training_epochs": (1.0, 50.0, int),
+            "training_learning_rate": (0.0001, 0.2, float),
+            "max_experiences": (100.0, 500000.0, int),
+        }
+        for key, (low, high, output_type) in numeric_limits.items():
+            raw = value.get(key)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+                continue
+            clamped = max(low, min(high, float(raw)))
+            result[key] = output_type(clamped)
+
+        for key in ("auto_launch_game", "auto_queue_battle"):
+            raw = value.get(key)
+            if isinstance(raw, bool):
+                result[key] = raw
+        return result
+
+    def _read_raw(self) -> Any:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return dict(DEFAULT_CONFIG)
-        try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(value, dict):
-                raise ValueError("config must be a JSON object")
-        except Exception:
-            return dict(DEFAULT_CONFIG)
-        merged = dict(DEFAULT_CONFIG)
-        merged.update(value)
-        return merged
+            return new_default_config()
+        return self._normalize(self._read_raw())
 
     def repair(self) -> tuple[dict[str, Any], bool]:
-        current = self.load()
-        changed = False
-        for key, value in DEFAULT_CONFIG.items():
-            if key not in current or not isinstance(current[key], type(value)):
-                current[key] = value
-                changed = True
-        if current.get("schema") != DEFAULT_CONFIG["schema"]:
-            current["schema"] = DEFAULT_CONFIG["schema"]
-            changed = True
-        if not self.path.exists() or changed:
+        raw = self._read_raw() if self.path.exists() else None
+        current = self._normalize(raw)
+        changed = raw != current
+        if changed:
             atomic_write_json(self.path, current)
-            return current, True
-        return current, False
+        return current, changed
 
 
 class ModelStore:
@@ -264,23 +421,59 @@ class ModelStore:
             if model.get("feature_count") != FEATURE_COUNT or model.get("action_count") != ACTION_COUNT:
                 return False
             weights = model["weights"]
-            if len(weights) != ACTION_COUNT:
+            if not isinstance(weights, list) or len(weights) != ACTION_COUNT:
                 return False
             for row in weights:
-                if len(row) != FEATURE_COUNT:
+                if not isinstance(row, list) or len(row) != FEATURE_COUNT:
                     return False
-                if not all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in row):
+                if not all(
+                    not isinstance(value, bool)
+                    and isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    for value in row
+                ):
                     return False
             return True
         except Exception:
             return False
 
+    @classmethod
+    def normalize(cls, model: Any) -> Optional[dict[str, Any]]:
+        if not cls.valid(model):
+            return None
+        result = copy.deepcopy(model)
+        result["schema"] = 1
+        result["app_version"] = APP_VERSION
+        generation = result.get("generation", 0)
+        result["generation"] = generation if isinstance(generation, int) and generation >= 0 else 0
+        samples = result.get("training_samples", 0)
+        result["training_samples"] = samples if isinstance(samples, int) and samples >= 0 else 0
+        result.setdefault("created_utc", utc_now())
+        result.setdefault("updated_utc", utc_now())
+        benchmark = result.get("benchmark")
+        if not isinstance(benchmark, dict):
+            benchmark = {}
+        status = benchmark.get("status")
+        if status not in {"unverified", "verified"}:
+            status = "unverified"
+        if status == "verified" and not isinstance(benchmark.get("evidence"), dict):
+            status = "unverified"
+        result["benchmark"] = {
+            **benchmark,
+            "status": status,
+            "note": str(benchmark.get("note", "No validated professional-level benchmark is bundled.")),
+        }
+        return result
+
     def load(self) -> dict[str, Any]:
         with self._lock:
             try:
                 value = json.loads(self.path.read_text(encoding="utf-8"))
-                if self.valid(value):
-                    return value
+                normalized = self.normalize(value)
+                if normalized is not None:
+                    if normalized != value:
+                        atomic_write_json(self.path, normalized)
+                    return normalized
             except Exception:
                 pass
             value = self.default_model()
@@ -288,10 +481,15 @@ class ModelStore:
             return value
 
     def repair(self) -> bool:
-        existed = self.path.exists()
         try:
-            if existed and self.valid(json.loads(self.path.read_text(encoding="utf-8"))):
-                return False
+            if self.path.exists():
+                value = json.loads(self.path.read_text(encoding="utf-8"))
+                normalized = self.normalize(value)
+                if normalized is not None:
+                    if normalized != value:
+                        atomic_write_json(self.path, normalized)
+                        return True
+                    return False
         except Exception:
             pass
         atomic_write_json(self.path, self.default_model())
@@ -338,13 +536,26 @@ class ExperiencePool:
 
     @staticmethod
     def valid_item(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        features = item.get("features")
+        action = item.get("action")
+        reward = item.get("reward")
         return (
-            isinstance(item, dict)
-            and isinstance(item.get("features"), list)
-            and len(item["features"]) == FEATURE_COUNT
-            and isinstance(item.get("action"), int)
-            and 0 <= item["action"] < ACTION_COUNT
-            and isinstance(item.get("reward"), (int, float))
+            isinstance(features, list)
+            and len(features) == FEATURE_COUNT
+            and all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                for value in features
+            )
+            and not isinstance(action, bool)
+            and isinstance(action, int)
+            and 0 <= action < ACTION_COUNT
+            and not isinstance(reward, bool)
+            and isinstance(reward, (int, float))
+            and math.isfinite(float(reward))
         )
 
     def append(self, features: list[float], action: int, reward: float, meta: Optional[dict[str, Any]] = None) -> None:
@@ -364,13 +575,13 @@ class ExperiencePool:
     def load(self, limit: int) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
-        result: list[dict[str, Any]] = []
+        if limit <= 0:
+            return []
+        result: deque[dict[str, Any]] = deque(maxlen=limit)
         with self._lock:
             try:
                 with self.path.open("r", encoding="utf-8") as handle:
                     for line in handle:
-                        if len(result) >= limit:
-                            break
                         try:
                             item = json.loads(line)
                         except Exception:
@@ -379,10 +590,10 @@ class ExperiencePool:
                             result.append(item)
             except OSError:
                 return []
-        return result
+        return list(result)
 
     def compact(self, max_items: int) -> None:
-        items = self.load(max_items * 2)
+        items = self.load(max_items + 1)
         if len(items) <= max_items:
             return
         kept = items[-max_items:]
@@ -393,19 +604,69 @@ class ExperiencePool:
 
 
 class DependencyManager:
-    MODULES = ("PIL", "numpy", "cv2")
-
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
 
-    def available(self) -> bool:
-        add_vendor_path()
+    def _marker_valid(self) -> bool:
         try:
-            for name in self.MODULES:
-                __import__(name)
-            return True
+            marker = json.loads(self.paths.dependency_marker.read_text(encoding="utf-8"))
+            return (
+                marker.get("python") == ".".join(map(str, REQUIRED_PYTHON))
+                and marker.get("requirements") == list(DEPENDENCIES)
+            )
         except Exception:
             return False
+
+    def available(self) -> bool:
+        if not self._marker_valid():
+            return False
+        add_vendor_path()
+        importlib.invalidate_caches()
+        for name in DEPENDENCY_MODULES:
+            try:
+                spec = importlib.util.find_spec(name)
+                if spec is None or not spec.origin:
+                    return False
+                if not path_is_within(Path(spec.origin), self.paths.vendor):
+                    return False
+            except Exception:
+                return False
+        return True
+
+    @staticmethod
+    def _validate_staging(staging: Path) -> dict[str, str]:
+        code = r"""
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+import PIL, numpy, cv2
+mods = {"PIL": PIL, "numpy": numpy, "cv2": cv2}
+for name, module in mods.items():
+    origin = pathlib.Path(module.__file__).resolve()
+    try:
+        origin.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} loaded outside vendor: {origin}") from exc
+print(json.dumps({name: str(getattr(module, "__version__", "unknown")) for name, module in mods.items()}))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(staging)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=45,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            raise RuntimeError("依赖导入验证失败：" + (result.stderr or result.stdout)[-800:])
+        try:
+            versions = json.loads(result.stdout.strip().splitlines()[-1])
+        except Exception as exc:
+            raise RuntimeError("依赖版本信息无效") from exc
+        if not isinstance(versions, dict):
+            raise RuntimeError("依赖版本信息无效")
+        return {str(key): str(value) for key, value in versions.items()}
 
     def install(self, progress: Callable[[str], None], stop: threading.Event) -> None:
         if self.available():
@@ -413,7 +674,7 @@ class DependencyManager:
             return
         if stop.is_set():
             return
-        progress("下载并安装图像与数值计算依赖…")
+        progress("准备下载图像与数值计算依赖…")
         try:
             subprocess.run(
                 [sys.executable, "-m", "pip", "--version"],
@@ -432,6 +693,10 @@ class DependencyManager:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
 
+        staging = self.paths.temp / f"vendor-install-{os.getpid()}-{time.time_ns()}"
+        old_vendor = self.paths.temp / f"vendor-old-{os.getpid()}-{time.time_ns()}"
+        remove_tree(staging)
+        staging.mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable,
             "-m",
@@ -440,49 +705,95 @@ class DependencyManager:
             "--disable-pip-version-check",
             "--no-warn-script-location",
             "--no-cache-dir",
+            "--only-binary=:all:",
             "--upgrade",
             "--target",
-            str(self.paths.vendor),
+            str(staging),
             *DEPENDENCIES,
         ]
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         install_env = os.environ.copy()
         install_env["PIP_CACHE_DIR"] = str(self.paths.temp / "pip-cache")
         install_env["TMP"] = str(self.paths.temp)
         install_env["TEMP"] = str(self.paths.temp)
+        output_path = self.paths.temp / f"pip-install-{os.getpid()}-{time.time_ns()}.log"
+        output_handle = output_path.open("w+b")
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
+            stdout=output_handle,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=creationflags,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             env=install_env,
         )
-        last_line = ""
-        assert process.stdout is not None
-        while process.poll() is None:
-            if stop.is_set():
-                process.terminate()
-                raise RuntimeError("依赖安装已取消")
-            line = process.stdout.readline().strip()
-            if line and line != last_line:
-                last_line = line
-                if "Downloading" in line or "Installing" in line or "Successfully" in line:
-                    progress(line[:110])
-        output = process.stdout.read()
-        if process.returncode != 0:
-            raise RuntimeError("依赖下载失败：" + (output[-600:] if output else "pip exited with error"))
-        add_vendor_path()
-        if not self.available():
-            raise RuntimeError("依赖已下载，但无法导入；请重新进入“文件”模式")
-        progress("依赖安装完成")
+        try:
+            last_notice = 0.0
+            while process.poll() is None:
+                if stop.wait(0.20):
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise RuntimeError("依赖安装已取消")
+                if time.monotonic() - last_notice >= 4.0:
+                    last_notice = time.monotonic()
+                    progress("正在下载并安装依赖…")
+            output_handle.flush()
+            output_handle.seek(0)
+            output = output_handle.read().decode("utf-8", errors="replace")
+            if process.returncode != 0:
+                raise RuntimeError("依赖下载失败：" + (output[-1200:] if output else "pip exited with error"))
+
+            progress("验证依赖完整性…")
+            versions = self._validate_staging(staging)
+            atomic_write_json(
+                staging / ".installed.json",
+                {
+                    "schema": 1,
+                    "installed_utc": utc_now(),
+                    "python": ".".join(map(str, REQUIRED_PYTHON)),
+                    "requirements": list(DEPENDENCIES),
+                    "versions": versions,
+                },
+            )
+
+            if self.paths.vendor.exists():
+                remove_tree(old_vendor)
+                os.replace(self.paths.vendor, old_vendor)
+            try:
+                os.replace(staging, self.paths.vendor)
+            except Exception:
+                if old_vendor.exists() and not self.paths.vendor.exists():
+                    os.replace(old_vendor, self.paths.vendor)
+                raise
+            remove_tree(old_vendor)
+            importlib.invalidate_caches()
+            if not self.available():
+                raise RuntimeError("依赖已安装，但完整性复检失败")
+            progress("依赖安装完成")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            output_handle.close()
+            try:
+                output_path.unlink()
+            except FileNotFoundError:
+                pass
+            remove_tree(staging)
 
 
 class RemoteUpdater:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
+
+    @staticmethod
+    def _open_https(url: str, timeout: float) -> Any:
+        request = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        response = urllib.request.urlopen(request, timeout=timeout)
+        final_url = str(response.geturl())
+        if not final_url.lower().startswith("https://"):
+            response.close()
+            raise ValueError("更新地址重定向到了非 HTTPS 地址")
+        return response
 
     def apply(self, manifest_url: str, progress: Callable[[str], None], stop: threading.Event) -> int:
         if not manifest_url:
@@ -490,48 +801,97 @@ class RemoteUpdater:
         if not manifest_url.lower().startswith("https://"):
             raise ValueError("update_manifest_url 必须使用 HTTPS")
         progress("检查远程更新清单…")
-        request = urllib.request.Request(manifest_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-        with urllib.request.urlopen(request, timeout=20) as response:
-            manifest = json.loads(response.read().decode("utf-8"))
-        files = manifest.get("files", [])
-        if not isinstance(files, list):
+        with self._open_https(manifest_url, 20) as response:
+            raw_manifest = response.read(2 * 1024 * 1024 + 1)
+        if len(raw_manifest) > 2 * 1024 * 1024:
+            raise ValueError("更新清单过大")
+        manifest = json.loads(raw_manifest.decode("utf-8"))
+        if not isinstance(manifest, dict):
             raise ValueError("更新清单格式错误")
+        files = manifest.get("files", [])
+        if not isinstance(files, list) or len(files) > 1000:
+            raise ValueError("更新清单格式错误")
+
+        seen: set[str] = set()
         changed = 0
         for index, item in enumerate(files, 1):
             if stop.is_set():
                 break
-            relative = str(item.get("path", "")).replace("\\", "/")
-            expected = str(item.get("sha256", "")).lower()
-            url = str(item.get("url", ""))
-            if not relative or relative.startswith("/") or ".." in Path(relative).parts:
-                raise ValueError(f"拒绝不安全的更新路径：{relative}")
-            if len(expected) != 64 or not url.lower().startswith("https://"):
-                raise ValueError(f"更新项无效：{relative}")
-            target = (self.paths.root / relative).resolve()
-            if self.paths.root.resolve() not in target.parents:
+            if not isinstance(item, dict):
+                raise ValueError("更新项格式错误")
+            relative = str(item.get("path", "")).replace("\\", "/").strip()
+            expected = str(item.get("sha256", "")).lower().strip()
+            url = str(item.get("url", "")).strip()
+            declared_size = item.get("size")
+            relative_path = Path(relative)
+            seen_key = relative_path.as_posix().casefold()
+            if (
+                not relative
+                or relative_path.is_absolute()
+                or ".." in relative_path.parts
+                or seen_key in seen
+            ):
+                raise ValueError(f"拒绝不安全或重复的更新路径：{relative}")
+            seen.add(seen_key)
+            if relative_path.parts and relative_path.parts[0].casefold() in {"backup", "logs", "temp"}:
+                raise ValueError(f"拒绝更新受保护目录：{relative}")
+            if relative.casefold() == "checksums.json":
+                raise ValueError("拒绝由远程清单覆盖 checksums.json")
+            if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+                raise ValueError(f"更新项 SHA-256 无效：{relative}")
+            if not url.lower().startswith("https://"):
+                raise ValueError(f"更新项必须使用 HTTPS：{relative}")
+            if declared_size is not None:
+                if isinstance(declared_size, bool) or not isinstance(declared_size, int):
+                    raise ValueError(f"更新项大小无效：{relative}")
+                if declared_size < 0 or declared_size > MAX_UPDATE_FILE_BYTES:
+                    raise ValueError(f"更新项过大：{relative}")
+
+            target = (self.paths.root / relative_path).resolve()
+            if not path_is_within(target, self.paths.root) or target == self.paths.root.resolve():
                 raise ValueError(f"更新目标越界：{relative}")
-            if target.exists() and sha256_file(target) == expected:
+            if target.exists() and target.is_file() and sha256_file(target) == expected:
                 continue
+
             progress(f"下载更新 {index}/{len(files)}：{relative}")
             target.parent.mkdir(parents=True, exist_ok=True)
             fd, temp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".download", dir=str(target.parent))
             os.close(fd)
+            temp_path = Path(temp_name)
             try:
-                with urllib.request.urlopen(url, timeout=45) as response, open(temp_name, "wb") as handle:
+                total = 0
+                with self._open_https(url, 45) as response, temp_path.open("wb") as handle:
+                    content_length = response.headers.get("Content-Length")
+                    if content_length:
+                        try:
+                            remote_size = int(content_length)
+                        except ValueError:
+                            remote_size = -1
+                        if remote_size > MAX_UPDATE_FILE_BYTES:
+                            raise RuntimeError(f"更新文件过大：{relative}")
                     while True:
                         chunk = response.read(1024 * 256)
                         if not chunk:
                             break
                         if stop.is_set():
                             raise RuntimeError("更新已取消")
+                        total += len(chunk)
+                        if total > MAX_UPDATE_FILE_BYTES:
+                            raise RuntimeError(f"更新文件过大：{relative}")
                         handle.write(chunk)
-                if sha256_file(Path(temp_name)) != expected:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if declared_size is not None and total != declared_size:
+                    raise RuntimeError(f"更新文件大小校验失败：{relative}")
+                if sha256_file(temp_path) != expected:
                     raise RuntimeError(f"更新文件校验失败：{relative}")
-                os.replace(temp_name, target)
+                if target == self.paths.launcher and not launcher_source_valid(temp_path):
+                    raise RuntimeError("远程启动文件未通过结构验证")
+                os.replace(temp_path, target)
                 changed += 1
             finally:
                 try:
-                    os.unlink(temp_name)
+                    temp_path.unlink()
                 except FileNotFoundError:
                     pass
         return changed
@@ -570,28 +930,77 @@ class IntegrityService:
             )
         return errors
 
-    def repair_launcher_backup(self) -> bool:
-        backup = self.paths.root / "backup" / "ClashRoyale.py"
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        if not self.paths.launcher.exists():
-            return False
-        if not backup.exists():
-            shutil.copy2(self.paths.launcher, backup)
-            return True
+    def _previous_hash(self, relative: str) -> Optional[str]:
         try:
-            current_hash = sha256_file(self.paths.launcher)
-            backup_hash = sha256_file(backup)
-            if current_hash == backup_hash:
-                return False
-            backup_text = backup.read_text(encoding="utf-8", errors="ignore")[:12000]
-            marker = f'APP_VERSION = "{APP_VERSION}"'
-            if marker in backup_text:
-                shutil.copy2(backup, self.paths.launcher)
-            else:
-                shutil.copy2(self.paths.launcher, backup)
-            return True
-        except OSError:
-            return False
+            records = json.loads(self.paths.checksums.read_text(encoding="utf-8"))
+            value = records["files"][relative]["sha256"]
+            if isinstance(value, str) and len(value) == 64:
+                return value.lower()
+        except Exception:
+            pass
+        return None
+
+    def repair_launcher_backup(self, accept_current: bool = False) -> Optional[str]:
+        launcher = self.paths.launcher
+        backup = self.paths.launcher_backup
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        if not launcher.exists():
+            source = Path(__file__).resolve()
+            if launcher_source_valid(source):
+                shutil.copy2(source, launcher)
+                shutil.copy2(source, backup)
+                return "已补全 ClashRoyale.py 及其备份"
+            return None
+
+        current_valid = launcher_source_valid(launcher)
+        backup_valid = backup.exists() and launcher_source_valid(backup)
+        expected = self._previous_hash("ClashRoyale.py")
+        current_hash = sha256_file(launcher) if launcher.is_file() else ""
+        backup_hash = sha256_file(backup) if backup_valid else ""
+
+        if accept_current and current_valid:
+            if not backup_valid or backup_hash != current_hash:
+                shutil.copy2(launcher, backup)
+                return "已刷新启动文件备份"
+            return None
+        if current_valid and backup_valid and launcher_version(launcher) > launcher_version(backup):
+            shutil.copy2(launcher, backup)
+            return "已接受较新版本并刷新启动文件备份"
+        if expected and current_hash != expected and backup_valid and backup_hash == expected:
+            shutil.copy2(backup, launcher)
+            return "已从可信备份恢复 ClashRoyale.py"
+        if not current_valid and backup_valid:
+            shutil.copy2(backup, launcher)
+            return "已替换损坏的 ClashRoyale.py"
+        if not current_valid:
+            raise RuntimeError("ClashRoyale.py 结构损坏，且没有可用备份")
+        if not backup_valid or backup_hash != current_hash:
+            shutil.copy2(launcher, backup)
+            return "已刷新启动文件备份"
+        return None
+
+    def _write_integrity_records(self) -> None:
+        records: dict[str, Any] = {
+            "schema": 1,
+            "generated_utc": utc_now(),
+            "app_version": APP_VERSION,
+            "files": {},
+        }
+        tracked = (
+            self.paths.launcher,
+            self.paths.launcher_backup,
+            self.paths.config,
+            self.paths.model,
+            self.paths.experiences,
+            self.paths.dependency_marker,
+        )
+        for path in tracked:
+            if path.exists() and path.is_file() and path_is_within(path, self.paths.root):
+                records["files"][str(path.relative_to(self.paths.root)).replace("\\", "/")] = {
+                    "sha256": sha256_file(path),
+                    "size": path.stat().st_size,
+                }
+        atomic_write_json(self.paths.checksums, records)
 
     def run(self, progress: Callable[[str], None], stop: threading.Event) -> dict[str, Any]:
         self.paths.ensure_dirs()
@@ -601,9 +1010,10 @@ class IntegrityService:
             raise RuntimeError("；".join(errors))
         repaired: list[str] = []
 
-        progress("检查启动文件备份…")
-        if self.repair_launcher_backup():
-            repaired.append("backup/ClashRoyale.py")
+        progress("检查启动文件与可信备份…")
+        backup_result = self.repair_launcher_backup()
+        if backup_result:
+            repaired.append(backup_result)
 
         progress("检查配置文件…")
         config, config_changed = self.config_store.repair()
@@ -625,21 +1035,24 @@ class IntegrityService:
         updated = self.remote.apply(str(config.get("update_manifest_url", "")).strip(), progress, stop)
         if updated:
             repaired.append(f"远程更新 {updated} 个文件")
+            progress("复检远程更新后的文件…")
+            config, config_changed = self.config_store.repair()
+            if config_changed:
+                repaired.append("远程配置已规范化")
+            if self.model_store.repair():
+                repaired.append("远程模型无效，已重建")
+            if self.pool.ensure():
+                repaired.append("远程经验池无效，已修复")
+            if not launcher_source_valid(self.paths.launcher):
+                raise RuntimeError("远程更新后的 ClashRoyale.py 未通过结构验证")
+            self.dependencies.install(progress, stop)
+
+        backup_result = self.repair_launcher_backup(accept_current=bool(updated))
+        if backup_result and backup_result not in repaired:
+            repaired.append(backup_result)
 
         progress("生成完整性记录…")
-        records: dict[str, Any] = {
-            "schema": 1,
-            "generated_utc": utc_now(),
-            "app_version": APP_VERSION,
-            "files": {},
-        }
-        for path in (self.paths.launcher, self.paths.config, self.paths.model, self.paths.experiences):
-            if path.exists() and path.is_file():
-                records["files"][str(path.relative_to(self.paths.root)).replace("\\", "/")] = {
-                    "sha256": sha256_file(path),
-                    "size": path.stat().st_size,
-                }
-        atomic_write_json(self.paths.checksums, records)
+        self._write_integrity_records()
         progress("文件完整性检查完成")
         return {"repaired": repaired, "updated": updated}
 
@@ -657,7 +1070,6 @@ class IntegrityService:
 
 class WindowsControl:
     user32 = ctypes.windll.user32 if os.name == "nt" else None
-    kernel32 = ctypes.windll.kernel32 if os.name == "nt" else None
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
@@ -684,14 +1096,21 @@ class WindowsControl:
         def enum_callback(hwnd: int, _lparam: int) -> bool:
             if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
                 return True
+            process_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            if process_id.value == os.getpid():
+                return True
             title = self._text(hwnd).strip()
             folded = title.casefold()
             if not title or not any(keyword in folded for keyword in keywords):
                 return True
             rect = wintypes.RECT()
-            if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
-                candidates.append((area, int(hwnd), title))
+            if user32.GetClientRect(hwnd, ctypes.byref(rect)):
+                width = max(0, rect.right - rect.left)
+                height = max(0, rect.bottom - rect.top)
+                if width >= 360 and height >= 540:
+                    area = width * height
+                    candidates.append((area, int(hwnd), title))
             return True
 
         user32.EnumWindows(callback_type(enum_callback), 0)
@@ -723,6 +1142,12 @@ class WindowsControl:
             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / r"Google\Play Games\Bootstrapper.exe",
             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / r"BlueStacks_nxt\HD-Player.exe",
             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / r"BlueStacks\HD-Player.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / r"LDPlayer\LDPlayer9\dnplayer.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / r"ldplayer9box\dnplayer.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / r"Netease\MuMuPlayerGlobal-12.0\shell\MuMuPlayer.exe",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+            / r"Nemu\EmulatorShell\NemuPlayer.exe",
         ]
         matches.extend(path for path in direct_candidates if path.exists())
         if not matches:
@@ -763,14 +1188,20 @@ class WindowsControl:
         if os.name != "nt":
             raise RuntimeError("Windows APIs unavailable")
         assert self.user32 is not None
-        rect = wintypes.RECT()
-        if not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            raise RuntimeError("无法读取游戏窗口范围")
-        width = rect.right - rect.left
-        height = rect.bottom - rect.top
-        if width < 480 or height < 640:
+        client = wintypes.RECT()
+        if not self.user32.GetClientRect(hwnd, ctypes.byref(client)):
+            raise RuntimeError("无法读取游戏客户区范围")
+        top_left = wintypes.POINT(client.left, client.top)
+        bottom_right = wintypes.POINT(client.right, client.bottom)
+        if not self.user32.ClientToScreen(hwnd, ctypes.byref(top_left)):
+            raise RuntimeError("无法转换游戏客户区坐标")
+        if not self.user32.ClientToScreen(hwnd, ctypes.byref(bottom_right)):
+            raise RuntimeError("无法转换游戏客户区坐标")
+        width = bottom_right.x - top_left.x
+        height = bottom_right.y - top_left.y
+        if width < 360 or height < 540:
             raise RuntimeError("游戏窗口尺寸过小")
-        return rect.left, rect.top, rect.right, rect.bottom
+        return top_left.x, top_left.y, bottom_right.x, bottom_right.y
 
     def click_normalized(self, hwnd: int, x: float, y: float) -> None:
         if os.name != "nt":
@@ -804,6 +1235,47 @@ class VisionEngine:
             scale = 540.0 / width
             array = self.cv2.resize(array, (540, max(1, int(height * scale))), interpolation=self.cv2.INTER_AREA)
         return array
+
+    def find_lobby_action(self, frame: Any) -> Optional[tuple[float, float, float]]:
+        """Locate a prominent central action button without relying on OCR or fixed pixels."""
+        np = self.np
+        cv2 = self.cv2
+        height, width = frame.shape[:2]
+        if height < 200 or width < 200:
+            return None
+        roi_y1 = int(height * 0.50)
+        roi_y2 = int(height * 0.96)
+        roi = frame[roi_y1:roi_y2]
+        red = roi[:, :, 0].astype(np.int16)
+        green = roi[:, :, 1].astype(np.int16)
+        blue = roi[:, :, 2].astype(np.int16)
+        yellow = (red > 165) & (green > 105) & (blue < 155) & (red > blue * 1.30) & (green > blue * 1.08)
+        cyan_blue = (blue > 145) & (green > 95) & (blue > red * 1.08) & ((blue + green) > 285)
+        mask = (yellow | cyan_blue).astype(np.uint8) * 255
+        kernel = np.ones((5, 9), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best: Optional[tuple[float, float, float]] = None
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            wr = w / max(1, width)
+            hr = h / max(1, height)
+            cx = (x + w / 2.0) / max(1, width)
+            cy = (roi_y1 + y + h / 2.0) / max(1, height)
+            fill = float(cv2.contourArea(contour)) / max(1.0, float(w * h))
+            if not (0.18 <= wr <= 0.78 and 0.03 <= hr <= 0.20):
+                continue
+            if not (0.24 <= cx <= 0.76 and 0.56 <= cy <= 0.94):
+                continue
+            if fill < 0.38:
+                continue
+            centrality = max(0.0, 1.0 - abs(cx - 0.5) / 0.26)
+            lower_preference = max(0.0, 1.0 - abs(cy - 0.79) / 0.25)
+            size_score = min(1.0, wr / 0.45) * min(1.0, hr / 0.09)
+            confidence = 0.42 * fill + 0.25 * centrality + 0.18 * lower_preference + 0.15 * size_score
+            if best is None or confidence > best[2]:
+                best = (cx, cy, confidence)
+        return best
 
     def analyze(self, frame: Any) -> dict[str, Any]:
         np = self.np
@@ -1097,6 +1569,9 @@ class GameAI:
         previous_action = WAIT_ACTION
         previous_features: Optional[list[float]] = None
         last_status = 0.0
+        last_lobby_click = 0.0
+        low_confidence_frames = 0
+        lobby_cooldown = max(4.0, min(30.0, float(self.config.get("lobby_click_cooldown_seconds", 8.0))))
 
         while not stop.is_set():
             started = time.monotonic()
@@ -1108,7 +1583,12 @@ class GameAI:
             frame = self.vision.capture(rect)
             analysis = self.vision.analyze(frame)
 
-            if previous_analysis is not None and previous_features is not None:
+            if (
+                previous_analysis is not None
+                and previous_features is not None
+                and previous_analysis["battle_confidence"] >= 0.52
+                and analysis["battle_confidence"] >= 0.40
+            ):
                 reward = self.reward(previous_analysis, analysis, previous_action)
                 self.pool.append(
                     previous_features,
@@ -1120,20 +1600,44 @@ class GameAI:
                     },
                 )
 
+            queued = False
             if analysis["battle_confidence"] < 0.52:
                 action = WAIT_ACTION
+                low_confidence_frames += 1
+                now = time.monotonic()
+                if (
+                    bool(self.config.get("auto_queue_battle", True))
+                    and low_confidence_frames >= 3
+                    and now - last_lobby_click >= lobby_cooldown
+                    and not stop.is_set()
+                ):
+                    lobby_action = self.vision.find_lobby_action(frame)
+                    if lobby_action is not None and lobby_action[2] >= 0.68:
+                        self.control.focus(hwnd)
+                        self.control.click_normalized(hwnd, lobby_action[0], lobby_action[1])
+                        last_lobby_click = now
+                        low_confidence_frames = 0
+                        queued = True
+                        previous_analysis = None
+                        previous_features = None
             else:
+                low_confidence_frames = 0
                 action = self.policy.choose(analysis)
-                self.policy.execute(self.control, hwnd, action)
+                if not stop.is_set():
+                    self.policy.execute(self.control, hwnd, action)
 
-            previous_analysis = analysis
-            previous_features = list(analysis["features"])
-            previous_action = action
+            if not queued:
+                previous_analysis = analysis
+                previous_features = list(analysis["features"])
+                previous_action = action
 
             now = time.monotonic()
             if now - last_status > 1.8:
                 last_status = now
-                action_text = "等待" if action == WAIT_ACTION else f"卡位 {action // 6 + 1} / 目标 {action % 6 + 1}"
+                if queued:
+                    action_text = "尝试进入下一场对战"
+                else:
+                    action_text = "等待" if action == WAIT_ACTION else f"卡位 {action // 6 + 1} / 目标 {action % 6 + 1}"
                 progress(
                     f"AI运行中｜圣水≈{analysis['elixir']:.1f}｜威胁 L {analysis['left_threat']:.2f} "
                     f"R {analysis['right_threat']:.2f}｜{action_text}"
@@ -1172,10 +1676,8 @@ class GlobalEscapeWatcher:
 class ClashRoyaleApp:
     def __init__(self) -> None:
         import tkinter as tk
-        from tkinter import messagebox
 
         self.tk = tk
-        self.messagebox = messagebox
         self.paths = PATHS
         self.paths.ensure_dirs()
         self.integrity = IntegrityService(self.paths)
@@ -1416,6 +1918,7 @@ class ClashRoyaleApp:
 
 
 def main() -> None:
+    enable_dpi_awareness()
     relocate_to_desktop()
     PATHS.ensure_dirs()
     add_vendor_path()
