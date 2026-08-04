@@ -27,26 +27,54 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
 
 APP_NAME = "ClashRoyale"
-APP_VERSION = "1.2.0"
-REQUIRED_PYTHON = (3, 12, 10)
+APP_VERSION = "3.0.0"
+REQUIRED_PYTHON = (3, 12)
 DEPENDENCIES = (
     "Pillow>=10.2,<13",
     "numpy>=1.26,<3",
     "opencv-python-headless>=4.9,<5",
+    "onnxruntime>=1.18,<2",
 )
 MAX_UPDATE_FILE_BYTES = 512 * 1024 * 1024
 MAX_LAUNCHER_FILE_BYTES = 8 * 1024 * 1024
-MAX_JSON_FILE_BYTES = 32 * 1024 * 1024
-MAX_EXPERIENCE_LINE_BYTES = 1024 * 1024
+MAX_JSON_FILE_BYTES = 64 * 1024 * 1024
+MAX_EXPERIENCE_LINE_BYTES = 4 * 1024 * 1024
 MAX_EXPERIENCE_ITEMS = 500000
-VENDOR_MARKER_SCHEMA = 2
-FEATURE_COUNT = 10
-ACTION_COUNT = 25
-WAIT_ACTION = 24
+MAX_VISION_MODEL_BYTES = 64 * 1024 * 1024
+VENDOR_MARKER_SCHEMA = 3
+GRID_COLUMNS = 8
+GRID_ROWS = 12
+PLACEMENTS_PER_CARD = GRID_COLUMNS * GRID_ROWS
+ACTION_COUNT = 4 * PLACEMENTS_PER_CARD + 1
+WAIT_ACTION = ACTION_COUNT - 1
+STATE_SIZE = 192
+HIDDEN_1 = 128
+HIDDEN_2 = 64
+MAX_UNITS = 20
+EXPERIENCE_SCHEMA = 2
+MODEL_SCHEMA = 2
+VISION_LABEL_SCHEMA = 1
+USER_BENCHMARK_SCHEMA = 1
+USER_BENCHMARK_MIN_MATCHES = 100
+ARENA_MIN_MATCHES_PER_MODEL = 30
+MIN_HUMAN_DEMO_ACTIONS = 3000
+MIN_HUMAN_DEMO_EPISODES = 20
+VALID_RESULTS = {"pending", "win", "loss", "draw", "unknown"}
+VALID_SOURCES = {"human_demo", "ai_transition"}
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_deck_signature(value: str) -> tuple[str, ...]:
+    normalized = value.replace(",", "|").replace(";", "|").replace("，", "|").replace("；", "|")
+    cards = [part.strip().casefold() for part in normalized.split("|") if part.strip()]
+    return tuple(sorted(set(cards)))
+
+
+def canonical_deck_signature(cards: Any) -> str:
+    return "|".join(sorted({str(card).strip().casefold() for card in cards if str(card).strip()}))
 
 
 def sha256_file(path: Path) -> str:
@@ -55,6 +83,22 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def model_weights_digest(model: dict[str, Any]) -> str:
+    network = model.get("network", {})
+    payload = json.dumps(network, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def wilson_lower_bound(wins: int, matches: int, z: float = 1.959963984540054) -> float:
+    if matches <= 0 or wins < 0 or wins > matches:
+        return 0.0
+    proportion = wins / matches
+    denominator = 1.0 + (z * z) / matches
+    centre = proportion + (z * z) / (2.0 * matches)
+    margin = z * math.sqrt((proportion * (1.0 - proportion) + (z * z) / (4.0 * matches)) / matches)
+    return max(0.0, min(1.0, (centre - margin) / denominator))
 
 
 def strict_json_loads(value: str | bytes) -> Any:
@@ -144,18 +188,35 @@ def path_is_link(path: Path) -> bool:
 
 
 def remove_tree(path: Path, strict: bool = False) -> None:
-    if not path.exists():
+    exists = path.exists() or path_is_link(path)
+    if not exists:
         return
-    for child in path.rglob("*"):
-        try:
-            child.chmod(0o700)
-        except OSError:
-            pass
     try:
+        if path_is_link(path) or path.is_file():
+            path.unlink()
+            return
+        for child in path.rglob("*"):
+            if path_is_link(child):
+                continue
+            try:
+                child.chmod(0o700)
+            except OSError:
+                pass
         shutil.rmtree(path)
     except OSError:
         if strict:
             raise
+
+
+def ensure_real_directory(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists() or path_is_link(path)
+    if exists and (path_is_link(path) or not path.is_dir()):
+        quarantine = path.parent / f"{path.name}.quarantine-{time.time_ns()}"
+        os.replace(path, quarantine)
+    path.mkdir(parents=True, exist_ok=True)
+    if path_is_link(path) or not path.is_dir():
+        raise RuntimeError(f"无法创建安全目录：{path}")
 
 
 def quarantine_non_file(path: Path, temp_root: Path) -> Optional[Path]:
@@ -275,7 +336,12 @@ class AppPaths:
     launcher_backup: Path
     config: Path
     model: Path
+    candidate_model: Path
+    model_archive: Path
     experiences: Path
+    benchmarks: Path
+    vision_model: Path
+    vision_labels: Path
     checksums: Path
     vendor: Path
     dependency_marker: Path
@@ -291,7 +357,12 @@ class AppPaths:
             launcher_backup=root / "backup" / "ClashRoyale.py",
             config=root / "config.json",
             model=root / "model" / "policy.json",
+            candidate_model=root / "model" / "candidate.json",
+            model_archive=root / "model" / "archive",
             experiences=root / "data" / "experiences.jsonl",
+            benchmarks=root / "data" / "user_benchmark.jsonl",
+            vision_model=root / "vision" / "detector.onnx",
+            vision_labels=root / "vision" / "labels.json",
             checksums=root / "checksums.json",
             vendor=root / "vendor",
             dependency_marker=root / "vendor" / ".installed.json",
@@ -304,12 +375,14 @@ class AppPaths:
             self.root,
             self.launcher_backup.parent,
             self.model.parent,
+            self.model_archive,
             self.experiences.parent,
+            self.vision_model.parent,
             self.vendor,
             self.logs,
             self.temp,
         ):
-            path.mkdir(parents=True, exist_ok=True)
+            ensure_real_directory(path)
 
 
 PATHS = AppPaths.discover()
@@ -364,9 +437,13 @@ def add_vendor_path() -> None:
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "schema": 1,
+    "schema": 2,
     "app_version": APP_VERSION,
     "update_manifest_url": "",
+    "vision_model_url": "",
+    "vision_model_sha256": "",
+    "vision_labels_url": "",
+    "vision_labels_sha256": "",
     "window_title_keywords": ["Clash Royale", "皇室战争", "ClashRoyale"],
     "launcher_name_keywords": [
         "Clash Royale",
@@ -377,14 +454,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "MuMu",
     ],
     "card_costs": [3, 4, 4, 5],
-    "decision_interval_seconds": 1.25,
-    "exploration": 0.04,
+    "decision_interval_seconds": 0.85,
+    "exploration": 0.0,
     "auto_launch_game": True,
     "auto_queue_battle": True,
     "lobby_click_cooldown_seconds": 8.0,
-    "training_epochs": 5,
-    "training_learning_rate": 0.012,
+    "training_epochs_behavior_clone": 8,
+    "training_epochs_reinforcement": 4,
+    "training_learning_rate": 0.0008,
+    "training_batch_size": 64,
+    "training_validation_fraction": 0.20,
+    "min_human_demo_actions": MIN_HUMAN_DEMO_ACTIONS,
+    "min_human_demo_episodes": MIN_HUMAN_DEMO_EPISODES,
     "max_experiences": 50000,
+    "benchmark_deck_signature": "",
+    "benchmark_cup_band": "",
 }
 
 
@@ -423,16 +507,30 @@ class ConfigStore:
         defaults = new_default_config()
         if not isinstance(value, dict):
             return defaults
-
         result = new_default_config()
         result["schema"] = int(defaults["schema"])
         result["app_version"] = APP_VERSION
 
-        manifest_url = value.get("update_manifest_url", defaults["update_manifest_url"])
-        if isinstance(manifest_url, str):
-            manifest_url = manifest_url.strip()
-            if not manifest_url or manifest_url.lower().startswith("https://"):
-                result["update_manifest_url"] = manifest_url
+        for key in (
+            "update_manifest_url",
+            "vision_model_url",
+            "vision_labels_url",
+        ):
+            raw = value.get(key, defaults[key])
+            if isinstance(raw, str):
+                raw = raw.strip()
+                if not raw or raw.lower().startswith("https://"):
+                    result[key] = raw
+        for key in ("vision_model_sha256", "vision_labels_sha256"):
+            raw = value.get(key, defaults[key])
+            if isinstance(raw, str):
+                raw = raw.strip().lower()
+                if not raw or (len(raw) == 64 and all(ch in "0123456789abcdef" for ch in raw)):
+                    result[key] = raw
+        for key in ("benchmark_deck_signature", "benchmark_cup_band"):
+            raw = value.get(key, defaults[key])
+            if isinstance(raw, str):
+                result[key] = raw.strip()[:256]
 
         for key in ("window_title_keywords", "launcher_name_keywords"):
             raw = value.get(key)
@@ -453,19 +551,23 @@ class ConfigStore:
                 result["card_costs"] = normalized_costs
 
         numeric_limits: dict[str, tuple[float, float, type]] = {
-            "decision_interval_seconds": (0.55, 3.0, float),
-            "exploration": (0.0, 0.35, float),
+            "decision_interval_seconds": (0.35, 3.0, float),
+            "exploration": (0.0, 0.20, float),
             "lobby_click_cooldown_seconds": (4.0, 30.0, float),
-            "training_epochs": (1.0, 50.0, int),
-            "training_learning_rate": (0.0001, 0.2, float),
-            "max_experiences": (100.0, 500000.0, int),
+            "training_epochs_behavior_clone": (1.0, 50.0, int),
+            "training_epochs_reinforcement": (0.0, 50.0, int),
+            "training_learning_rate": (0.00001, 0.02, float),
+            "training_batch_size": (16.0, 512.0, int),
+            "training_validation_fraction": (0.10, 0.35, float),
+            "min_human_demo_actions": (1000.0, 100000.0, int),
+            "min_human_demo_episodes": (5.0, 1000.0, int),
+            "max_experiences": (5000.0, 500000.0, int),
         }
         for key, (low, high, output_type) in numeric_limits.items():
             raw = value.get(key)
             if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
                 continue
-            clamped = max(low, min(high, float(raw)))
-            result[key] = output_type(clamped)
+            result[key] = output_type(max(low, min(high, float(raw))))
 
         for key in ("auto_launch_game", "auto_queue_battle"):
             raw = value.get(key)
@@ -494,62 +596,88 @@ class ConfigStore:
 
 
 class ModelStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, candidate_path: Optional[Path] = None, archive_dir: Optional[Path] = None) -> None:
         self.path = path
+        self.candidate_path = candidate_path or path.with_name("candidate.json")
+        self.archive_dir = archive_dir or path.parent / "archive"
         self._lock = threading.RLock()
 
     @staticmethod
-    def default_model() -> dict[str, Any]:
-        rng = random.Random(20260802)
-        weights = [[rng.uniform(-0.03, 0.03) for _ in range(FEATURE_COUNT)] for _ in range(ACTION_COUNT)]
-        for card in range(4):
-            base = card * 6
-            weights[base + 2][2] += 0.8
-            weights[base + 3][3] += 0.8
-            weights[base + 4][1] += 0.20
-            weights[base + 5][1] += 0.20
-            weights[base + 4][8] += 0.15
-            weights[base + 5][8] += 0.15
-        weights[WAIT_ACTION][1] -= 0.65
-        weights[WAIT_ACTION][2] -= 0.35
-        weights[WAIT_ACTION][3] -= 0.35
+    def _matrix(rows: int, columns: int, rng: random.Random, scale: float) -> list[list[float]]:
+        return [[rng.uniform(-scale, scale) for _ in range(columns)] for _ in range(rows)]
+
+    @classmethod
+    def default_model(cls) -> dict[str, Any]:
+        rng = random.Random(20260803)
+        scale1 = math.sqrt(2.0 / STATE_SIZE)
+        scale2 = math.sqrt(2.0 / HIDDEN_1)
+        scale_policy = math.sqrt(2.0 / HIDDEN_2)
         return {
-            "schema": 1,
+            "schema": MODEL_SCHEMA,
             "app_version": APP_VERSION,
             "generation": 0,
             "created_utc": utc_now(),
             "updated_utc": utc_now(),
-            "feature_count": FEATURE_COUNT,
+            "state_size": STATE_SIZE,
             "action_count": ACTION_COUNT,
-            "weights": weights,
-            "training_samples": 0,
-            "benchmark": {
-                "status": "unverified",
-                "note": "No validated professional-level benchmark is bundled.",
+            "architecture": [STATE_SIZE, HIDDEN_1, HIDDEN_2, ACTION_COUNT, 1],
+            "network": {
+                "w1": cls._matrix(HIDDEN_1, STATE_SIZE, rng, scale1),
+                "b1": [0.0] * HIDDEN_1,
+                "w2": cls._matrix(HIDDEN_2, HIDDEN_1, rng, scale2),
+                "b2": [0.0] * HIDDEN_2,
+                "policy_w": cls._matrix(ACTION_COUNT, HIDDEN_2, rng, scale_policy),
+                "policy_b": [0.0] * ACTION_COUNT,
+                "value_w": [rng.uniform(-scale_policy, scale_policy) for _ in range(HIDDEN_2)],
+                "value_b": 0.0,
+            },
+            "training": {
+                "human_demo_samples": 0,
+                "ai_transition_samples": 0,
+                "train_episode_count": 0,
+                "validation_episode_count": 0,
+            },
+            "evaluation": {
+                "status": "official",
+                "note": "初始策略价值网络；尚未完成用户基准评测。",
             },
         }
 
     @staticmethod
-    def valid(model: Any) -> bool:
+    def _finite_vector(value: Any, length: int) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) == length
+            and all(not isinstance(item, bool) and isinstance(item, (int, float)) and math.isfinite(float(item)) for item in value)
+        )
+
+    @classmethod
+    def _finite_matrix(cls, value: Any, rows: int, columns: int) -> bool:
+        return isinstance(value, list) and len(value) == rows and all(cls._finite_vector(row, columns) for row in value)
+
+    @classmethod
+    def valid(cls, model: Any) -> bool:
         try:
             if not isinstance(model, dict):
                 return False
-            if model.get("feature_count") != FEATURE_COUNT or model.get("action_count") != ACTION_COUNT:
+            if model.get("schema") != MODEL_SCHEMA or model.get("state_size") != STATE_SIZE or model.get("action_count") != ACTION_COUNT:
                 return False
-            weights = model["weights"]
-            if not isinstance(weights, list) or len(weights) != ACTION_COUNT:
+            if model.get("architecture") != [STATE_SIZE, HIDDEN_1, HIDDEN_2, ACTION_COUNT, 1]:
                 return False
-            for row in weights:
-                if not isinstance(row, list) or len(row) != FEATURE_COUNT:
-                    return False
-                if not all(
-                    not isinstance(value, bool)
-                    and isinstance(value, (int, float))
-                    and math.isfinite(float(value))
-                    for value in row
-                ):
-                    return False
-            return True
+            network = model.get("network")
+            return (
+                isinstance(network, dict)
+                and cls._finite_matrix(network.get("w1"), HIDDEN_1, STATE_SIZE)
+                and cls._finite_vector(network.get("b1"), HIDDEN_1)
+                and cls._finite_matrix(network.get("w2"), HIDDEN_2, HIDDEN_1)
+                and cls._finite_vector(network.get("b2"), HIDDEN_2)
+                and cls._finite_matrix(network.get("policy_w"), ACTION_COUNT, HIDDEN_2)
+                and cls._finite_vector(network.get("policy_b"), ACTION_COUNT)
+                and cls._finite_vector(network.get("value_w"), HIDDEN_2)
+                and not isinstance(network.get("value_b"), bool)
+                and isinstance(network.get("value_b"), (int, float))
+                and math.isfinite(float(network.get("value_b")))
+            )
         except Exception:
             return False
 
@@ -558,73 +686,89 @@ class ModelStore:
         if not cls.valid(model):
             return None
         result = copy.deepcopy(model)
-        result["schema"] = 1
         result["app_version"] = APP_VERSION
-        generation = result.get("generation", 0)
-        result["generation"] = (
-            generation if not isinstance(generation, bool) and isinstance(generation, int) and generation >= 0 else 0
-        )
-        samples = result.get("training_samples", 0)
-        result["training_samples"] = (
-            samples if not isinstance(samples, bool) and isinstance(samples, int) and samples >= 0 else 0
-        )
-        result["weights"] = [
-            [max(-8.0, min(8.0, float(value))) for value in row]
-            for row in result["weights"]
-        ]
+        result["generation"] = max(0, int(result.get("generation", 0)))
         for key in ("created_utc", "updated_utc"):
-            value = result.get(key)
-            result[key] = value if isinstance(value, str) and value.strip() else utc_now()
-        benchmark = result.get("benchmark")
-        if not isinstance(benchmark, dict):
-            benchmark = {}
-        status = benchmark.get("status")
-        if status not in {"unverified", "verified"}:
-            status = "unverified"
-        if status == "verified" and not isinstance(benchmark.get("evidence"), dict):
-            status = "unverified"
-        result["benchmark"] = {
-            **benchmark,
-            "status": status,
-            "note": str(benchmark.get("note", "No validated professional-level benchmark is bundled.")),
-        }
+            if not isinstance(result.get(key), str) or not result[key].strip():
+                result[key] = utc_now()
+        for key, value in result["network"].items():
+            if isinstance(value, list) and value and isinstance(value[0], list):
+                result["network"][key] = [[max(-12.0, min(12.0, float(x))) for x in row] for row in value]
+            elif isinstance(value, list):
+                result["network"][key] = [max(-12.0, min(12.0, float(x))) for x in value]
+            else:
+                result["network"][key] = max(-12.0, min(12.0, float(value)))
+        if not isinstance(result.get("training"), dict):
+            result["training"] = {}
+        if not isinstance(result.get("evaluation"), dict):
+            result["evaluation"] = {"status": "unverified"}
         return result
+
+    def _load_path(self, path: Path, create_default: bool = False) -> Optional[dict[str, Any]]:
+        try:
+            value = read_json_file(path)
+            normalized = self.normalize(value)
+            if normalized is not None:
+                if normalized != value:
+                    atomic_write_json(path, normalized)
+                return normalized
+        except Exception:
+            pass
+        if create_default:
+            value = self.default_model()
+            atomic_write_json(path, value)
+            return value
+        return None
 
     def load(self) -> dict[str, Any]:
         with self._lock:
-            try:
-                value = read_json_file(self.path)
-                normalized = self.normalize(value)
-                if normalized is not None:
-                    if normalized != value:
-                        atomic_write_json(self.path, normalized)
-                    return normalized
-            except Exception:
-                pass
-            value = self.default_model()
-            atomic_write_json(self.path, value)
-            return value
+            result = self._load_path(self.path, create_default=True)
+            assert result is not None
+            return result
+
+    def load_candidate(self) -> Optional[dict[str, Any]]:
+        with self._lock:
+            return self._load_path(self.candidate_path, create_default=False) if self.candidate_path.exists() else None
 
     def repair(self) -> bool:
-        try:
-            if self.path.exists():
-                value = read_json_file(self.path)
-                normalized = self.normalize(value)
-                if normalized is not None:
-                    if normalized != value:
-                        atomic_write_json(self.path, normalized)
-                        return True
-                    return False
-        except Exception:
-            pass
-        atomic_write_json(self.path, self.default_model())
-        return True
-
-    def save(self, model: dict[str, Any]) -> None:
-        if not self.valid(model):
-            raise ValueError("refusing to save an invalid model")
         with self._lock:
-            atomic_write_json(self.path, model)
+            if self._load_path(self.path, create_default=False) is None:
+                atomic_write_json(self.path, self.default_model())
+                return True
+            if self.candidate_path.exists() and self._load_path(self.candidate_path, create_default=False) is None:
+                quarantine = self.candidate_path.with_name(f"candidate.invalid-{time.time_ns()}.json")
+                os.replace(self.candidate_path, quarantine)
+                return True
+            return False
+
+    def save(self, model: dict[str, Any], candidate: bool = False) -> None:
+        normalized = self.normalize(model)
+        if normalized is None:
+            raise ValueError("拒绝保存无效的策略价值网络")
+        with self._lock:
+            atomic_write_json(self.candidate_path if candidate else self.path, normalized)
+
+    def promote_candidate(self, benchmark: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            candidate = self.load_candidate()
+            if candidate is None:
+                raise RuntimeError("没有可晋升的候选模型")
+            self.archive_dir.mkdir(parents=True, exist_ok=True)
+            active = self.load()
+            archive = self.archive_dir / f"policy-g{int(active.get('generation', 0)):06d}-{time.time_ns()}.json"
+            atomic_write_json(archive, active)
+            candidate["evaluation"] = {
+                "status": "official",
+                "promoted_utc": utc_now(),
+                "user_benchmark": benchmark,
+            }
+            candidate["updated_utc"] = utc_now()
+            self.save(candidate, candidate=False)
+            try:
+                self.candidate_path.unlink()
+            except FileNotFoundError:
+                pass
+            return candidate
 
 
 class ExperiencePool:
@@ -648,6 +792,57 @@ class ExperiencePool:
                 except UnicodeDecodeError:
                     yield None
 
+    @staticmethod
+    def _finite_state(value: Any) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) == STATE_SIZE
+            and all(not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(float(x)) for x in value)
+        )
+
+    @classmethod
+    def valid_item(cls, item: Any) -> bool:
+        if not isinstance(item, dict) or item.get("schema") != EXPERIENCE_SCHEMA:
+            return False
+        episode_id = item.get("episode_id")
+        legal_actions = item.get("legal_actions")
+        action = item.get("action")
+        reward = item.get("reward")
+        result = item.get("result")
+        source = item.get("source")
+        return (
+            isinstance(episode_id, str) and 1 <= len(episode_id.strip()) <= 160
+            and cls._finite_state(item.get("state"))
+            and isinstance(legal_actions, list) and bool(legal_actions)
+            and len(legal_actions) <= ACTION_COUNT
+            and all(not isinstance(x, bool) and isinstance(x, int) and 0 <= x < ACTION_COUNT for x in legal_actions)
+            and len(set(legal_actions)) == len(legal_actions)
+            and not isinstance(action, bool) and isinstance(action, int) and action in legal_actions
+            and not isinstance(reward, bool) and isinstance(reward, (int, float)) and math.isfinite(float(reward))
+            and cls._finite_state(item.get("next_state"))
+            and isinstance(item.get("done"), bool)
+            and result in VALID_RESULTS
+            and source in VALID_SOURCES
+        )
+
+    @staticmethod
+    def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "schema": EXPERIENCE_SCHEMA,
+            "ts": str(item.get("ts") or utc_now()),
+            "episode_id": str(item["episode_id"]).strip(),
+            "step_id": max(0, int(item.get("step_id", 0))),
+            "state": [round(max(-8.0, min(8.0, float(x))), 6) for x in item["state"]],
+            "legal_actions": sorted(set(int(x) for x in item["legal_actions"])),
+            "action": int(item["action"]),
+            "reward": round(max(-2.0, min(2.0, float(item["reward"]))), 6),
+            "next_state": [round(max(-8.0, min(8.0, float(x))), 6) for x in item["next_state"]],
+            "done": bool(item["done"]),
+            "result": str(item["result"]),
+            "source": str(item["source"]),
+            "meta": item.get("meta") if isinstance(item.get("meta"), dict) else {},
+        }
+
     def ensure(self, max_items: int = MAX_EXPERIENCE_ITEMS) -> bool:
         max_items = max(1, min(MAX_EXPERIENCE_ITEMS, int(max_items)))
         with self._lock:
@@ -655,81 +850,201 @@ class ExperiencePool:
             if not self.path.exists():
                 self.path.touch()
                 return True
-            good_lines: deque[str] = deque(maxlen=max_items)
+            good: deque[str] = deque(maxlen=max_items)
+            rejected: list[str] = []
             damaged = False
-            valid_count = 0
-            try:
-                for line in self._lines():
+            for line in self._lines():
+                if line is None or not line.strip():
                     if line is None:
                         damaged = True
-                        continue
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        item = strict_json_loads(stripped)
-                        if self.valid_item(item):
-                            valid_count += 1
-                            good_lines.append(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
-                        else:
-                            damaged = True
-                    except Exception:
+                    continue
+                try:
+                    item = strict_json_loads(line)
+                    if self.valid_item(item):
+                        normalized = self.normalize_item(item)
+                        good.append(json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+                    else:
+                        rejected.append(line.rstrip("\n"))
                         damaged = True
-            except OSError:
-                damaged = True
-            if valid_count > max_items:
-                damaged = True
+                except Exception:
+                    rejected.append(line.rstrip("\n"))
+                    damaged = True
             if damaged:
-                atomic_write_text(self.path, "".join(line + "\n" for line in good_lines))
+                if rejected:
+                    reject_path = self.path.with_name(f"experiences.rejected-{time.time_ns()}.jsonl")
+                    atomic_write_text(reject_path, "\n".join(rejected) + "\n")
+                atomic_write_text(self.path, "".join(line + "\n" for line in good))
             return damaged
 
-    @staticmethod
-    def valid_item(item: Any) -> bool:
-        if not isinstance(item, dict):
-            return False
-        features = item.get("features")
-        action = item.get("action")
-        reward = item.get("reward")
-        return (
-            isinstance(features, list)
-            and len(features) == FEATURE_COUNT
-            and all(
-                not isinstance(value, bool)
-                and isinstance(value, (int, float))
-                and math.isfinite(float(value))
-                for value in features
-            )
-            and not isinstance(action, bool)
-            and isinstance(action, int)
-            and 0 <= action < ACTION_COUNT
-            and not isinstance(reward, bool)
-            and isinstance(reward, (int, float))
-            and math.isfinite(float(reward))
-        )
-
-    def append(self, features: list[float], action: int, reward: float, meta: Optional[dict[str, Any]] = None) -> None:
-        candidate = {"features": features, "action": action, "reward": reward}
-        if not self.valid_item(candidate):
-            raise ValueError("拒绝写入无效经验")
-        item = {
-            "ts": utc_now(),
-            "features": [round(float(v), 6) for v in features],
-            "action": int(action),
-            "reward": round(float(max(-2.0, min(2.0, reward))), 6),
-            "meta": meta or {},
-        }
-        line = json.dumps(item, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+    def append_transition(self, item: dict[str, Any]) -> None:
+        if not self.valid_item(item):
+            raise ValueError("拒绝写入不完整或无效的状态转换")
+        normalized = self.normalize_item(item)
+        line = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
+            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(line)
+                handle.flush()
+
+    def append_many(self, items: list[dict[str, Any]]) -> int:
+        lines: list[str] = []
+        for item in items:
+            if not self.valid_item(item):
+                raise ValueError("拒绝批量写入无效状态转换")
+            lines.append(json.dumps(self.normalize_item(item), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
+        if not lines:
+            return 0
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.writelines(lines)
+                handle.flush()
+                os.fsync(handle.fileno())
+        return len(lines)
 
     def load(self, limit: int) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        if limit <= 0:
+        if not self.path.exists() or limit <= 0:
             return []
         result: deque[dict[str, Any]] = deque(maxlen=limit)
+        with self._lock:
+            try:
+                for line in self._lines():
+                    if line is None or not line.strip():
+                        continue
+                    try:
+                        item = strict_json_loads(line)
+                    except Exception:
+                        continue
+                    if self.valid_item(item):
+                        result.append(self.normalize_item(item))
+            except OSError:
+                return []
+        return list(result)
+
+    def count(self, source: Optional[str] = None, limit: int = MAX_EXPERIENCE_ITEMS + 1) -> int:
+        count = 0
+        for item in self.load(limit):
+            if source is None or item.get("source") == source:
+                count += 1
+        return count
+
+    def episode_counts(self, source: Optional[str] = None, limit: int = MAX_EXPERIENCE_ITEMS) -> tuple[int, int]:
+        items = self.load(limit)
+        filtered = [item for item in items if source is None or item.get("source") == source]
+        return len(filtered), len({item["episode_id"] for item in filtered})
+
+    def split_by_episode(self, validation_fraction: float, limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        items = self.load(limit)
+        episodes: dict[str, list[dict[str, Any]]] = {}
+        for item in items:
+            episodes.setdefault(item["episode_id"], []).append(item)
+        ordered = sorted(episodes.items(), key=lambda pair: min(str(x.get("ts", "")) for x in pair[1]))
+        if len(ordered) < 2:
+            return items, []
+        validation_count = max(1, min(len(ordered) - 1, int(math.ceil(len(ordered) * validation_fraction))))
+        validation_ids = {episode_id for episode_id, _ in ordered[-validation_count:]}
+        train = [item for item in items if item["episode_id"] not in validation_ids]
+        validation = [item for item in items if item["episode_id"] in validation_ids]
+        assert not ({item["episode_id"] for item in train} & {item["episode_id"] for item in validation})
+        return train, validation
+
+    def compact(self, max_items: int) -> bool:
+        max_items = max(1, min(MAX_EXPERIENCE_ITEMS, int(max_items)))
+        items = self.load(max_items + 1)
+        if len(items) <= max_items:
+            return False
+        kept = items[-max_items:]
+        if kept and int(kept[0].get("step_id", 0)) != 0:
+            first_episode = kept[0]["episode_id"]
+            kept = [item for item in kept if item["episode_id"] != first_episode]
+        atomic_write_text(
+            self.path,
+            "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n" for item in kept),
+        )
+        return True
+
+
+class BenchmarkStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def valid_record(record: Any) -> bool:
+        if not isinstance(record, dict) or record.get("schema") != USER_BENCHMARK_SCHEMA:
+            return False
+        return (
+            isinstance(record.get("episode_id"), str)
+            and record.get("actor") in {"human", "ai"}
+            and isinstance(record.get("model_sha256"), str)
+            and isinstance(record.get("deck_signature"), str)
+            and isinstance(record.get("cup_band"), str)
+            and isinstance(record.get("valid"), bool)
+            and record.get("result") in {"win", "loss", "draw", "unknown"}
+            and all(not isinstance(record.get(key), bool) and isinstance(record.get(key), (int, float)) and math.isfinite(float(record.get(key))) for key in ("crown_diff", "tower_hp_diff"))
+        )
+
+    def ensure(self) -> bool:
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.path.exists():
+                self.path.touch()
+                return True
+            valid_lines: list[str] = []
+            rejected: list[str] = []
+            try:
+                with self.path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            item = strict_json_loads(line)
+                        except Exception:
+                            rejected.append(line.rstrip("\n"))
+                            continue
+                        if self.valid_record(item):
+                            valid_lines.append(json.dumps(item, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+                        else:
+                            rejected.append(line.rstrip("\n"))
+            except OSError:
+                rejected.append("无法读取原基准文件")
+            if not rejected:
+                return False
+            reject_path = self.path.with_name(f"user_benchmark.rejected-{time.time_ns()}.jsonl")
+            atomic_write_text(reject_path, "\n".join(rejected) + "\n")
+            atomic_write_text(self.path, "".join(line + "\n" for line in valid_lines))
+            return True
+
+    def append(self, record: dict[str, Any]) -> None:
+        candidate = {
+            "schema": USER_BENCHMARK_SCHEMA,
+            "ts": str(record.get("ts") or utc_now()),
+            "episode_id": str(record.get("episode_id", "")),
+            "actor": str(record.get("actor", "")),
+            "model_sha256": str(record.get("model_sha256", "")),
+            "model_role": str(record.get("model_role", "none")),
+            "deck_signature": str(record.get("deck_signature", "")),
+            "cup_band": str(record.get("cup_band", "")),
+            "valid": bool(record.get("valid", False)),
+            "exclusion_reason": str(record.get("exclusion_reason", "")),
+            "result": str(record.get("result", "unknown")),
+            "crown_diff": float(record.get("crown_diff", 0.0)),
+            "tower_hp_diff": float(record.get("tower_hp_diff", 0.0)),
+            "vision_failure": bool(record.get("vision_failure", False)),
+            "disconnected": bool(record.get("disconnected", False)),
+        }
+        if not self.valid_record(candidate):
+            raise ValueError("拒绝写入无效用户基准记录")
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(candidate, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
+
+    def load(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        result: list[dict[str, Any]] = []
         with self._lock:
             try:
                 with self.path.open("r", encoding="utf-8") as handle:
@@ -738,24 +1053,95 @@ class ExperiencePool:
                             item = strict_json_loads(line)
                         except Exception:
                             continue
-                        if self.valid_item(item):
+                        if self.valid_record(item):
                             result.append(item)
             except OSError:
-                return []
-        return list(result)
+                pass
+        return result
 
-    def compact(self, max_items: int) -> bool:
-        max_items = max(1, min(MAX_EXPERIENCE_ITEMS, int(max_items)))
-        with self._lock:
-            items = self.load(max_items + 1)
-            if len(items) <= max_items:
-                return False
-            kept = items[-max_items:]
-            atomic_write_text(
-                self.path,
-                "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n" for item in kept),
-            )
-            return True
+    def evaluate_user_benchmark(self, candidate_digest: str, deck_signature: str, cup_band: str) -> dict[str, Any]:
+        records = [
+            item for item in self.load()
+            if item["valid"] and not item["vision_failure"] and not item["disconnected"]
+            and item["deck_signature"] == deck_signature and item["cup_band"] == cup_band
+        ]
+        human = [item for item in records if item["actor"] == "human"]
+        ai = [item for item in records if item["actor"] == "ai" and item["model_sha256"] == candidate_digest]
+        human_wins = sum(item["result"] == "win" for item in human)
+        ai_wins = sum(item["result"] == "win" for item in ai)
+        user_win_rate = human_wins / len(human) if human else 0.0
+        lower = wilson_lower_bound(ai_wins, len(ai))
+        matches = len(ai)
+        candidate_passed = (
+            matches >= USER_BENCHMARK_MIN_MATCHES
+            and wilson_lower_bound(ai_wins, matches) > user_win_rate
+        )
+        passed = len(human) >= USER_BENCHMARK_MIN_MATCHES and candidate_passed
+        def average(rows: list[dict[str, Any]], key: str) -> float:
+            return sum(float(row[key]) for row in rows) / len(rows) if rows else 0.0
+        return {
+            "schema": USER_BENCHMARK_SCHEMA,
+            "deck_signature": deck_signature,
+            "cup_band": cup_band,
+            "human_matches": len(human),
+            "human_wins": human_wins,
+            "user_win_rate": round(user_win_rate, 6),
+            "ai_matches": len(ai),
+            "ai_wins": ai_wins,
+            "ai_win_rate": round(ai_wins / len(ai), 6) if ai else 0.0,
+            "ai_wilson_lower_bound": round(lower, 6),
+            "human_average_crown_diff": round(average(human, "crown_diff"), 6),
+            "ai_average_crown_diff": round(average(ai, "crown_diff"), 6),
+            "human_average_tower_hp_diff": round(average(human, "tower_hp_diff"), 6),
+            "ai_average_tower_hp_diff": round(average(ai, "tower_hp_diff"), 6),
+            "candidate_passed": passed,
+        }
+
+    def evaluate_candidate_arena(self, candidate_digest: str, official_digest: str, deck_signature: str, cup_band: str) -> dict[str, Any]:
+        records = [
+            item for item in self.load()
+            if item["valid"] and item["actor"] == "ai" and item["deck_signature"] == deck_signature and item["cup_band"] == cup_band
+        ]
+        candidate = [item for item in records if item["model_sha256"] == candidate_digest]
+        official = [item for item in records if item["model_sha256"] == official_digest]
+        candidate_wins = sum(item["result"] == "win" for item in candidate)
+        official_wins = sum(item["result"] == "win" for item in official)
+        official_rate = official_wins / len(official) if official else 1.0
+        candidate_lower = wilson_lower_bound(candidate_wins, len(candidate))
+        return {
+            "candidate_matches": len(candidate),
+            "official_matches": len(official),
+            "candidate_win_rate": round(candidate_wins / len(candidate), 6) if candidate else 0.0,
+            "official_win_rate": round(official_rate, 6),
+            "candidate_wilson_lower_bound": round(candidate_lower, 6),
+            "candidate_passed": (
+                len(candidate) >= ARENA_MIN_MATCHES_PER_MODEL
+                and len(official) >= ARENA_MIN_MATCHES_PER_MODEL
+                and candidate_lower > official_rate
+            ),
+        }
+
+
+class UserBenchmark:
+    """Evaluate a candidate against the user's real-match baseline."""
+
+    @staticmethod
+    def evaluate(store: BenchmarkStore, candidate_digest: str, deck_signature: str, cup_band: str) -> dict[str, Any]:
+        return store.evaluate_user_benchmark(candidate_digest, deck_signature, cup_band)
+
+
+class CandidateArena:
+    """Compare candidate and official models on alternating real matchmaking episodes."""
+
+    @staticmethod
+    def evaluate(
+        store: BenchmarkStore,
+        candidate_digest: str,
+        official_digest: str,
+        deck_signature: str,
+        cup_band: str,
+    ) -> dict[str, Any]:
+        return store.evaluate_candidate_arena(candidate_digest, official_digest, deck_signature, cup_band)
 
 
 class DependencyManager:
@@ -839,8 +1225,8 @@ class DependencyManager:
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
-import PIL, numpy, cv2
-mods = {"PIL": PIL, "numpy": numpy, "cv2": cv2}
+import PIL, numpy, cv2, onnxruntime
+mods = {"PIL": PIL, "numpy": numpy, "cv2": cv2, "onnxruntime": onnxruntime}
 for name, module in mods.items():
     origin = pathlib.Path(module.__file__).resolve()
     try:
@@ -1168,14 +1554,165 @@ class RemoteUpdater:
             remove_tree(staging)
 
 
+class VisionAssetManager:
+    def __init__(self, paths: AppPaths) -> None:
+        self.paths = paths
+
+    @staticmethod
+    def _valid_sha(value: str) -> bool:
+        return len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+    @staticmethod
+    def _download(url: str, target: Path, expected_sha: str, max_bytes: int, progress: Callable[[str], None], stop: threading.Event) -> None:
+        if not url.lower().startswith("https://"):
+            raise RuntimeError(f"下载地址必须使用 HTTPS：{target.name}")
+        request = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        fd, temp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".download", dir=str(target.parent))
+        os.close(fd)
+        temp = Path(temp_name)
+        try:
+            total = 0
+            with urllib.request.urlopen(request, timeout=45) as response, temp.open("wb") as handle:
+                final_url = str(response.geturl())
+                if not final_url.lower().startswith("https://"):
+                    raise RuntimeError("视觉文件下载被重定向到非 HTTPS 地址")
+                while True:
+                    if stop.is_set():
+                        raise RuntimeError("视觉文件下载已取消")
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise RuntimeError(f"视觉文件过大：{target.name}")
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if sha256_file(temp) != expected_sha:
+                raise RuntimeError(f"视觉文件 SHA-256 校验失败：{target.name}")
+            os.replace(temp, target)
+            progress(f"已下载并校验 {target.name}")
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _labels_valid(path: Path) -> bool:
+        try:
+            data = read_json_file(path, 4 * 1024 * 1024)
+            if not isinstance(data, dict) or data.get("schema") != VISION_LABEL_SCHEMA:
+                return False
+            classes = data.get("classes")
+            if not isinstance(classes, dict) or not classes:
+                return False
+            allowed = {"card", "unit", "tower", "timer", "status", "screen", "elixir"}
+            kinds: list[str] = []
+            teams: set[str] = set()
+            towers: set[str] = set()
+            statuses: set[str] = set()
+            card_count = 0
+            for key, item in classes.items():
+                int(key)
+                if not isinstance(item, dict) or item.get("kind") not in allowed:
+                    return False
+                if not isinstance(item.get("name"), str) or not item["name"].strip():
+                    return False
+                kind = str(item["kind"]).casefold()
+                kinds.append(kind)
+                if kind == "card":
+                    card_count += 1
+                elif kind == "unit":
+                    teams.add(str(item.get("team", "")).casefold())
+                elif kind == "tower":
+                    towers.add(str(item.get("tower", "")).casefold())
+                elif kind in {"status", "screen"}:
+                    statuses.add(str(item.get("status", item.get("name", ""))).casefold())
+            required_towers = {"friendly_left", "friendly_right", "friendly_king", "enemy_left", "enemy_right", "enemy_king"}
+            friendly_team = bool(teams & {"friendly", "ally", "blue", "self"})
+            enemy_team = bool(teams & {"enemy", "opponent", "red"})
+            return (
+                card_count >= 4
+                and friendly_team and enemy_team
+                and required_towers.issubset(towers)
+                and "timer" in kinds
+                and {"double_elixir", "overtime", "win", "loss", "settlement"}.issubset(statuses)
+            )
+        except Exception:
+            return False
+
+    def _model_valid(self, path: Path) -> bool:
+        if not path.is_file() or path.stat().st_size <= 0 or path.stat().st_size > MAX_VISION_MODEL_BYTES:
+            return False
+        try:
+            add_vendor_path()
+            import numpy as np
+            import onnxruntime as ort
+            session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            inputs = session.get_inputs()
+            outputs = session.get_outputs()
+            if len(inputs) != 1 or not outputs or "float" not in str(inputs[0].type).casefold():
+                return False
+            shape = list(inputs[0].shape)
+            if len(shape) != 4:
+                return False
+            concrete = [1, 3, 384, 640]
+            for index, value in enumerate(shape):
+                if isinstance(value, int) and value > 0:
+                    concrete[index] = value
+            if concrete[0] != 1 or concrete[1] != 3:
+                return False
+            result = session.run([outputs[0].name], {inputs[0].name: np.zeros(concrete, dtype=np.float32)})[0]
+            array = np.asarray(result)
+            while array.ndim > 2 and array.shape[0] == 1:
+                array = array[0]
+            return array.ndim == 2 and 6 <= array.shape[1] <= 16
+        except Exception:
+            return False
+
+    def ensure(self, config: dict[str, Any], progress: Callable[[str], None], stop: threading.Event) -> list[str]:
+        repaired: list[str] = []
+        self.paths.vision_model.parent.mkdir(parents=True, exist_ok=True)
+        specs = (
+            ("vision_model_url", "vision_model_sha256", self.paths.vision_model, MAX_VISION_MODEL_BYTES),
+            ("vision_labels_url", "vision_labels_sha256", self.paths.vision_labels, 4 * 1024 * 1024),
+        )
+        for url_key, sha_key, target, limit in specs:
+            expected = str(config.get(sha_key, "")).strip().lower()
+            current_ok = target.is_file() and (not expected or sha256_file(target) == expected)
+            if target == self.paths.vision_model:
+                current_ok = current_ok and self._model_valid(target)
+            else:
+                current_ok = current_ok and self._labels_valid(target)
+            if current_ok:
+                continue
+            url = str(config.get(url_key, "")).strip()
+            if not url or not self._valid_sha(expected):
+                raise RuntimeError(
+                    f"缺少或损坏 {target.name}；请通过 update_manifest_url 下发该文件，"
+                    f"或在 config.json 配置 {url_key} 与 {sha_key}"
+                )
+            progress(f"下载视觉文件：{target.name}")
+            self._download(url, target, expected, limit, progress, stop)
+            repaired.append(str(target.relative_to(self.paths.root)).replace("\\", "/"))
+        if not self._model_valid(self.paths.vision_model):
+            raise RuntimeError("ONNX 视觉模型无法由 onnxruntime 加载")
+        if not self._labels_valid(self.paths.vision_labels):
+            raise RuntimeError("视觉标签文件格式无效")
+        return repaired
+
+
 class IntegrityService:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
         self.config_store = ConfigStore(paths.config)
-        self.model_store = ModelStore(paths.model)
+        self.model_store = ModelStore(paths.model, paths.candidate_model, paths.model_archive)
         self.pool = ExperiencePool(paths.experiences)
+        self.benchmarks = BenchmarkStore(paths.benchmarks)
         self.dependencies = DependencyManager(paths)
         self.remote = RemoteUpdater(paths)
+        self.vision_assets = VisionAssetManager(paths)
 
     @staticmethod
     def platform_errors() -> list[str]:
@@ -1194,9 +1731,9 @@ class IntegrityService:
                 errors.append("需要 x64 系统")
             if ctypes.sizeof(ctypes.c_void_p) != 8:
                 errors.append("需要 64 位 Python")
-        if sys.version_info[:3] != REQUIRED_PYTHON:
+        if sys.version_info[:2] != REQUIRED_PYTHON:
             errors.append(
-                "需要 Python 3.12.10；当前为 "
+                "需要 Python 3.12.x；当前为 "
                 + ".".join(str(value) for value in sys.version_info[:3])
             )
         return errors
@@ -1271,7 +1808,11 @@ class IntegrityService:
             self.paths.launcher_backup,
             self.paths.config,
             self.paths.model,
+            self.paths.candidate_model,
             self.paths.experiences,
+            self.paths.benchmarks,
+            self.paths.vision_model,
+            self.paths.vision_labels,
             self.paths.dependency_marker,
         )
         for path in tracked:
@@ -1308,6 +1849,9 @@ class IntegrityService:
         max_experiences = int(config.get("max_experiences", 50000))
         if self.pool.ensure(max_experiences):
             repaired.append("data/experiences.jsonl")
+        progress("检查 UserBenchmark 记录…")
+        if self.benchmarks.ensure():
+            repaired.append("data/user_benchmark.jsonl")
 
         self.dependencies.install(progress, stop, deep_check=True)
         if stop.is_set():
@@ -1325,9 +1869,15 @@ class IntegrityService:
             max_experiences = int(config.get("max_experiences", 50000))
             if self.pool.ensure(max_experiences):
                 repaired.append("远程经验池无效，已修复")
+            if self.benchmarks.ensure():
+                repaired.append("远程 UserBenchmark 记录无效，已修复")
             if not launcher_source_valid(self.paths.launcher):
                 raise RuntimeError("远程更新后的 ClashRoyale.py 未通过结构验证")
             self.dependencies.install(progress, stop, deep_check=True)
+
+        progress("检查 ONNX 视觉模型与标签…")
+        for repaired_path in self.vision_assets.ensure(config, progress, stop):
+            repaired.append(repaired_path)
 
         backup_result = self.repair_launcher_backup(accept_current=bool(updated))
         if backup_result and backup_result not in repaired:
@@ -1346,7 +1896,9 @@ class IntegrityService:
         config, _ = self.config_store.repair()
         self.model_store.repair()
         self.pool.ensure(int(config.get("max_experiences", 50000)))
+        self.benchmarks.ensure()
         self.dependencies.install(progress, stop, deep_check=False)
+        self.vision_assets.ensure(config, progress, stop)
         return config
 
 
@@ -1543,285 +2095,582 @@ class WindowsControl:
 
 
 class VisionEngine:
-    def __init__(self) -> None:
+    """ONNX-based semantic detector with a fixed state-vector contract."""
+
+    CARD_X = (0.285, 0.43, 0.57, 0.715)
+    CARD_Y = 0.91
+    ARENA_LEFT = 0.06
+    ARENA_RIGHT = 0.94
+    ARENA_TOP = 0.10
+    ARENA_BOTTOM = 0.82
+
+    def __init__(self, config: Optional[dict[str, Any]] = None, paths: AppPaths = PATHS) -> None:
         add_vendor_path()
         from PIL import ImageGrab
         import cv2
         import numpy as np
+        import onnxruntime as ort
 
+        self.config = config or new_default_config()
+        self.paths = paths
         self.ImageGrab = ImageGrab
         self.cv2 = cv2
         self.np = np
+        self.ort = ort
+        labels = read_json_file(paths.vision_labels, 4 * 1024 * 1024)
+        if not isinstance(labels, dict) or labels.get("schema") != VISION_LABEL_SCHEMA or not isinstance(labels.get("classes"), dict):
+            raise RuntimeError("视觉标签文件格式无效")
+        self.labels = {int(key): value for key, value in labels["classes"].items() if isinstance(value, dict)}
+        self.session = ort.InferenceSession(str(paths.vision_model), providers=["CPUExecutionProvider"])
+        inputs = self.session.get_inputs()
+        if not inputs:
+            raise RuntimeError("ONNX 视觉模型没有输入")
+        self.input_name = inputs[0].name
+        shape = list(inputs[0].shape)
+        self.input_height = int(shape[-2]) if len(shape) >= 4 and isinstance(shape[-2], int) and shape[-2] > 0 else 384
+        self.input_width = int(shape[-1]) if len(shape) >= 4 and isinstance(shape[-1], int) and shape[-1] > 0 else 640
+        self.output_names = [item.name for item in self.session.get_outputs()]
+        self._active_episode_id: Optional[str] = None
+        self._episode_counter = 0
+        self._last_battle_seen = 0.0
+        self._reset_after_result = False
 
     def capture(self, rect: tuple[int, int, int, int]) -> Any:
         image = self.ImageGrab.grab(bbox=rect, all_screens=True)
-        array = self.np.asarray(image.convert("RGB"))
-        height, width = array.shape[:2]
-        if width > 540:
-            scale = 540.0 / width
-            array = self.cv2.resize(array, (540, max(1, int(height * scale))), interpolation=self.cv2.INTER_AREA)
-        return array
+        return self.np.asarray(image.convert("RGB"))
 
     def find_lobby_action(self, frame: Any) -> Optional[tuple[float, float, float]]:
-        """Locate a prominent central action button without relying on OCR or fixed pixels."""
         np = self.np
         cv2 = self.cv2
         height, width = frame.shape[:2]
         if height < 200 or width < 200:
             return None
-        roi_y1 = int(height * 0.50)
-        roi_y2 = int(height * 0.96)
+        roi_y1, roi_y2 = int(height * 0.50), int(height * 0.96)
         roi = frame[roi_y1:roi_y2]
-        red = roi[:, :, 0].astype(np.int16)
-        green = roi[:, :, 1].astype(np.int16)
-        blue = roi[:, :, 2].astype(np.int16)
+        red, green, blue = [roi[:, :, index].astype(np.int16) for index in range(3)]
         yellow = (red > 165) & (green > 105) & (blue < 155) & (red > blue * 1.30) & (green > blue * 1.08)
         cyan_blue = (blue > 145) & (green > 95) & (blue > red * 1.08) & ((blue + green) > 285)
         mask = (yellow | cyan_blue).astype(np.uint8) * 255
-        kernel = np.ones((5, 9), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 9), np.uint8), iterations=2)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         best: Optional[tuple[float, float, float]] = None
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            wr = w / max(1, width)
-            hr = h / max(1, height)
+            wr, hr = w / max(1, width), h / max(1, height)
             cx = (x + w / 2.0) / max(1, width)
             cy = (roi_y1 + y + h / 2.0) / max(1, height)
             fill = float(cv2.contourArea(contour)) / max(1.0, float(w * h))
-            if not (0.18 <= wr <= 0.78 and 0.03 <= hr <= 0.20):
+            if not (0.18 <= wr <= 0.78 and 0.03 <= hr <= 0.20 and 0.24 <= cx <= 0.76 and 0.56 <= cy <= 0.94 and fill >= 0.38):
                 continue
-            if not (0.24 <= cx <= 0.76 and 0.56 <= cy <= 0.94):
-                continue
-            if fill < 0.38:
-                continue
-            centrality = max(0.0, 1.0 - abs(cx - 0.5) / 0.26)
-            lower_preference = max(0.0, 1.0 - abs(cy - 0.79) / 0.25)
-            size_score = min(1.0, wr / 0.45) * min(1.0, hr / 0.09)
-            confidence = 0.42 * fill + 0.25 * centrality + 0.18 * lower_preference + 0.15 * size_score
+            confidence = 0.45 * fill + 0.30 * max(0.0, 1.0 - abs(cx - 0.5) / 0.26) + 0.25 * max(0.0, 1.0 - abs(cy - 0.79) / 0.25)
             if best is None or confidence > best[2]:
                 best = (cx, cy, confidence)
         return best
 
-    def analyze(self, frame: Any) -> dict[str, Any]:
+    def _infer(self, frame: Any) -> list[dict[str, Any]]:
         np = self.np
         cv2 = self.cv2
+        resized = cv2.resize(frame, (self.input_width, self.input_height), interpolation=cv2.INTER_AREA)
+        tensor = resized.astype(np.float32) / 255.0
+        tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
+        outputs = self.session.run(self.output_names, {self.input_name: tensor})
+        if not outputs:
+            return []
+        rows = np.asarray(outputs[0])
+        while rows.ndim > 2 and rows.shape[0] == 1:
+            rows = rows[0]
+        if rows.ndim != 2 or not (6 <= rows.shape[1] <= 16):
+            raise RuntimeError("ONNX 检测输出必须为后处理后的 N×6 至 N×16，字段为 x1,y1,x2,y2,score,class_id[,health,dx,dy,value]")
+        detections: list[dict[str, Any]] = []
+        for row in rows:
+            score = float(row[4])
+            if not math.isfinite(score) or score < 0.35:
+                continue
+            class_id = int(round(float(row[5])))
+            label = self.labels.get(class_id)
+            if label is None:
+                continue
+            x1, y1, x2, y2 = [float(row[index]) for index in range(4)]
+            if max(abs(x1), abs(x2)) > 2.0:
+                x1, x2 = x1 / self.input_width, x2 / self.input_width
+            if max(abs(y1), abs(y2)) > 2.0:
+                y1, y2 = y1 / self.input_height, y2 / self.input_height
+            x1, x2 = sorted((max(0.0, min(1.0, x1)), max(0.0, min(1.0, x2))))
+            y1, y2 = sorted((max(0.0, min(1.0, y1)), max(0.0, min(1.0, y2))))
+            detections.append({
+                "class_id": class_id,
+                "label": label,
+                "score": score,
+                "x": (x1 + x2) / 2.0,
+                "y": (y1 + y2) / 2.0,
+                "w": max(0.0, x2 - x1),
+                "h": max(0.0, y2 - y1),
+                "health": max(0.0, min(1.0, float(row[6]))) if len(row) > 6 and math.isfinite(float(row[6])) else 1.0,
+                "dx": max(-1.0, min(1.0, float(row[7]))) if len(row) > 7 and math.isfinite(float(row[7])) else 0.0,
+                "dy": max(-1.0, min(1.0, float(row[8]))) if len(row) > 8 and math.isfinite(float(row[8])) else 0.0,
+                "value": float(row[9]) if len(row) > 9 and math.isfinite(float(row[9])) else 0.0,
+            })
+        return detections
+
+    @staticmethod
+    def _stable_id(name: str, explicit: Any) -> int:
+        if not isinstance(explicit, bool) and isinstance(explicit, int) and explicit >= 0:
+            return explicit
+        return int(hashlib.sha256(name.encode("utf-8")).hexdigest()[:8], 16) % 10000
+
+    def _heuristic_elixir(self, frame: Any) -> float:
+        np = self.np
         height, width = frame.shape[:2]
-        top, bottom = int(height * 0.10), int(height * 0.82)
-        left, right = int(width * 0.06), int(width * 0.94)
-        arena = frame[top:bottom, left:right]
-        if arena.size == 0:
-            raise RuntimeError("无法定位战场画面")
-
-        red = arena[:, :, 0].astype(np.int16)
-        green = arena[:, :, 1].astype(np.int16)
-        blue = arena[:, :, 2].astype(np.int16)
-        red_mask = ((red > 145) & (red > green * 1.28) & (red > blue * 1.22)).astype(np.uint8)
-        blue_mask = ((blue > 140) & (blue > red * 1.20) & (blue > green * 1.08)).astype(np.uint8)
-        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        count, _labels, stats, centers = cv2.connectedComponentsWithStats(red_mask, 8)
-        blobs: list[tuple[float, float, float]] = []
-        arena_area = float(arena.shape[0] * arena.shape[1])
-        for index in range(1, count):
-            area = float(stats[index, cv2.CC_STAT_AREA])
-            if area < max(7.0, arena_area * 0.000025) or area > arena_area * 0.035:
-                continue
-            cx, cy = centers[index]
-            nx = float(cx / max(1, arena.shape[1]))
-            ny = float(cy / max(1, arena.shape[0]))
-            if 0.05 <= nx <= 0.95 and 0.08 <= ny <= 0.95:
-                blobs.append((nx, ny, area / arena_area))
-
-        left_threat = 0.0
-        right_threat = 0.0
-        center_threat = 0.0
-        deepest = 0.0
-        for x, y, size in blobs:
-            proximity = max(0.0, (y - 0.35) / 0.65)
-            score = min(1.0, size * 180.0) * (0.25 + 0.75 * proximity)
-            deepest = max(deepest, y)
-            if x < 0.46:
-                left_threat += score
-            elif x > 0.54:
-                right_threat += score
-            else:
-                center_threat += score
-        left_threat = min(1.0, left_threat)
-        right_threat = min(1.0, right_threat)
-        center_threat = min(1.0, center_threat)
-
         bar = frame[int(height * 0.86):int(height * 0.93), int(width * 0.10):int(width * 0.90)]
-        if bar.size:
-            r = bar[:, :, 0].astype(np.int16)
-            g = bar[:, :, 1].astype(np.int16)
-            b = bar[:, :, 2].astype(np.int16)
-            purple = (r > 110) & (b > 125) & (r > g * 1.18) & (b > g * 1.20)
-            columns = purple.mean(axis=0) > 0.10
-            elixir_ratio = float(columns.mean()) if columns.size else 0.0
-        else:
-            elixir_ratio = 0.0
-        elixir = max(0.0, min(10.0, elixir_ratio * 12.0))
+        if not bar.size:
+            return 0.0
+        r, g, b = [bar[:, :, index].astype(np.int16) for index in range(3)]
+        purple = (r > 110) & (b > 125) & (r > g * 1.18) & (b > g * 1.20)
+        columns = purple.mean(axis=0) > 0.10
+        return max(0.0, min(10.0, float(columns.mean()) * 12.0 if columns.size else 0.0))
 
-        hsv = cv2.cvtColor(arena, cv2.COLOR_RGB2HSV)
-        saturation = float(hsv[:, :, 1].mean() / 255.0)
-        brightness = float(hsv[:, :, 2].mean() / 255.0)
+    @staticmethod
+    def encode_action(card_slot: int, column: int, row: int) -> int:
+        if not (0 <= card_slot < 4 and 0 <= column < GRID_COLUMNS and 0 <= row < GRID_ROWS):
+            raise ValueError("动作网格坐标越界")
+        return card_slot * PLACEMENTS_PER_CARD + row * GRID_COLUMNS + column
 
-        slot_scores: list[float] = []
-        for center_x in (0.285, 0.43, 0.57, 0.715):
-            x1 = max(0, int(width * (center_x - 0.055)))
-            x2 = min(width, int(width * (center_x + 0.055)))
-            y1 = max(0, int(height * 0.82))
-            y2 = min(height, int(height * 0.975))
-            slot = frame[y1:y2, x1:x2]
-            if slot.size == 0:
-                slot_scores.append(0.0)
+    @staticmethod
+    def decode_action(action: int) -> tuple[int, int, int]:
+        if action == WAIT_ACTION:
+            return -1, -1, -1
+        card, cell = divmod(action, PLACEMENTS_PER_CARD)
+        row, column = divmod(cell, GRID_COLUMNS)
+        return card, column, row
+
+    @classmethod
+    def grid_point(cls, column: int, row: int) -> tuple[float, float]:
+        x = cls.ARENA_LEFT + (column + 0.5) / GRID_COLUMNS * (cls.ARENA_RIGHT - cls.ARENA_LEFT)
+        y = cls.ARENA_TOP + (row + 0.5) / GRID_ROWS * (cls.ARENA_BOTTOM - cls.ARENA_TOP)
+        return x, y
+
+    @classmethod
+    def point_to_cell(cls, x: float, y: float) -> Optional[tuple[int, int]]:
+        if not (cls.ARENA_LEFT <= x <= cls.ARENA_RIGHT and cls.ARENA_TOP <= y <= cls.ARENA_BOTTOM):
+            return None
+        column = min(GRID_COLUMNS - 1, max(0, int((x - cls.ARENA_LEFT) / (cls.ARENA_RIGHT - cls.ARENA_LEFT) * GRID_COLUMNS)))
+        row = min(GRID_ROWS - 1, max(0, int((y - cls.ARENA_TOP) / (cls.ARENA_BOTTOM - cls.ARENA_TOP) * GRID_ROWS)))
+        return column, row
+
+    def _legal_actions(self, cards: list[Optional[dict[str, Any]]], elixir: float) -> list[int]:
+        legal = [WAIT_ACTION]
+        fallback_costs = [int(value) for value in self.config.get("card_costs", [3, 4, 4, 5])]
+        for slot, card in enumerate(cards):
+            if card is None:
                 continue
-            slot_hsv = cv2.cvtColor(slot, cv2.COLOR_RGB2HSV)
-            slot_variance = float(slot.astype(np.float32).std() / 82.0)
-            slot_saturation = float(slot_hsv[:, :, 1].mean() / 255.0)
-            slot_scores.append(max(0.0, min(1.0, 0.62 * slot_variance + 0.38 * slot_saturation)))
-        card_bar_confidence = sum(slot_scores) / max(1, len(slot_scores))
+            label = card["label"]
+            cost = label.get("cost", fallback_costs[slot] if slot < len(fallback_costs) else 10)
+            try:
+                cost_value = max(1, min(10, int(cost)))
+            except Exception:
+                cost_value = fallback_costs[slot]
+            if elixir + 0.35 < cost_value:
+                continue
+            placement = str(label.get("placement", "own")).casefold()
+            for row in range(GRID_ROWS):
+                if placement in {"own", "building"} and row < GRID_ROWS // 2:
+                    continue
+                if placement == "bridge" and row not in {GRID_ROWS // 2 - 1, GRID_ROWS // 2}:
+                    continue
+                for column in range(GRID_COLUMNS):
+                    legal.append(self.encode_action(slot, column, row))
+        return sorted(set(legal))
 
-        river_band = arena[int(arena.shape[0] * 0.42):int(arena.shape[0] * 0.53)]
-        if river_band.size:
-            rr = river_band[:, :, 0].astype(np.int16)
-            rg = river_band[:, :, 1].astype(np.int16)
-            rb = river_band[:, :, 2].astype(np.int16)
-            blue_water = (rb > rr * 1.08) & (rb > rg * 0.92) & (rb > 90)
-            river_confidence = min(1.0, float(blue_water.mean()) * 4.5)
-        else:
-            river_confidence = 0.0
+    def _state_vector(
+        self,
+        cards: list[Optional[dict[str, Any]]],
+        units: list[dict[str, Any]],
+        tower_hp: dict[str, float],
+        elixir: float,
+        battle_confidence: float,
+        match_time: float,
+        double_elixir: bool,
+        overtime: bool,
+        result: str,
+        done: bool,
+    ) -> list[float]:
+        state = [0.0] * STATE_SIZE
+        state[0] = 1.0
+        state[1] = elixir / 10.0
+        state[2] = battle_confidence
+        state[3] = max(0.0, min(1.0, match_time / 300.0))
+        state[4] = 1.0 if double_elixir else 0.0
+        state[5] = 1.0 if overtime else 0.0
+        state[6] = 1.0 if done else 0.0
+        state[7] = 1.0 if result == "win" else 0.0
+        state[8] = 1.0 if result == "loss" else 0.0
+        state[9] = 1.0 if result == "draw" else 0.0
+        fallback_costs = [int(value) for value in self.config.get("card_costs", [3, 4, 4, 5])]
+        for slot in range(4):
+            card = cards[slot]
+            if card is not None:
+                label = card["label"]
+                card_id = self._stable_id(str(label.get("name", "card")), label.get("card_id"))
+                state[10 + slot] = card_id / 10000.0
+                state[14 + slot] = float(card["score"])
+                try:
+                    cost = int(label.get("cost", fallback_costs[slot]))
+                except Exception:
+                    cost = fallback_costs[slot]
+                state[18 + slot] = max(0.0, min(1.0, cost / 10.0))
+        tower_order = ("friendly_left", "friendly_right", "friendly_king", "enemy_left", "enemy_right", "enemy_king")
+        for index, key in enumerate(tower_order):
+            state[22 + index] = max(0.0, min(1.0, float(tower_hp.get(key, 0.0))))
+        friendly_units = sum(unit["team"] > 0 for unit in units)
+        enemy_units = sum(unit["team"] < 0 for unit in units)
+        state[28] = min(1.0, friendly_units / MAX_UNITS)
+        state[29] = min(1.0, enemy_units / MAX_UNITS)
+        state[30] = min(1.0, sum(unit["health"] for unit in units if unit["team"] > 0) / MAX_UNITS)
+        state[31] = min(1.0, sum(unit["health"] for unit in units if unit["team"] < 0) / MAX_UNITS)
+        ranked = sorted(units, key=lambda unit: (unit["score"], unit["health"]), reverse=True)[:MAX_UNITS]
+        for index, unit in enumerate(ranked):
+            start = 32 + index * 8
+            state[start:start + 8] = [
+                float(unit["team"]),
+                float(unit["unit_id"]) / 10000.0,
+                float(unit["x"]),
+                float(unit["y"]),
+                float(unit["health"]),
+                float(unit["dx"]),
+                float(unit["dy"]),
+                float(unit["score"]),
+            ]
+        return state
 
-        zone_h, zone_w = red_mask.shape
-        upper_y1, upper_y2 = int(zone_h * 0.08), int(zone_h * 0.46)
-        lower_y1, lower_y2 = int(zone_h * 0.54), int(zone_h * 0.94)
-        left_x1, left_x2 = int(zone_w * 0.08), int(zone_w * 0.46)
-        right_x1, right_x2 = int(zone_w * 0.54), int(zone_w * 0.92)
+    def analyze(self, frame: Any) -> dict[str, Any]:
+        detections = self._infer(frame)
+        cards: list[Optional[dict[str, Any]]] = [None, None, None, None]
+        units: list[dict[str, Any]] = []
+        tower_hp: dict[str, float] = {}
+        match_time = 0.0
+        double_elixir = False
+        overtime = False
+        result = "pending"
+        elixir = self._heuristic_elixir(frame)
 
-        def zone_score(mask: Any, y1: int, y2: int, x1: int, x2: int) -> float:
-            zone = mask[y1:y2, x1:x2]
-            return min(1.0, float(zone.mean()) * 32.0) if zone.size else 0.0
+        for det in detections:
+            label = det["label"]
+            kind = str(label.get("kind", "")).casefold()
+            name = str(label.get("name", "unknown"))
+            if kind == "card" and det["y"] >= 0.76:
+                slot = min(range(4), key=lambda index: abs(self.CARD_X[index] - det["x"]))
+                if cards[slot] is None or det["score"] > cards[slot]["score"]:
+                    cards[slot] = det
+            elif kind == "unit":
+                team_text = str(label.get("team", "enemy")).casefold()
+                team = 1 if team_text in {"friendly", "ally", "blue", "self"} else -1
+                units.append({
+                    "name": name,
+                    "unit_id": self._stable_id(name, label.get("unit_id")),
+                    "team": team,
+                    "x": det["x"], "y": det["y"], "health": det["health"],
+                    "dx": det["dx"], "dy": det["dy"], "score": det["score"],
+                })
+            elif kind == "tower":
+                tower_key = str(label.get("tower", "")).casefold()
+                if not tower_key:
+                    team = "friendly" if det["y"] > 0.5 else "enemy"
+                    lane = "king" if 0.42 <= det["x"] <= 0.58 else ("left" if det["x"] < 0.5 else "right")
+                    tower_key = f"{team}_{lane}"
+                tower_hp[tower_key] = max(tower_hp.get(tower_key, 0.0), det["health"])
+            elif kind == "timer":
+                match_time = max(match_time, max(0.0, det["value"] or det["health"] * float(label.get("seconds_scale", 300.0))))
+            elif kind == "elixir":
+                elixir = max(0.0, min(10.0, det["value"] if det["value"] else det["health"] * 10.0))
+            elif kind in {"status", "screen"}:
+                status = str(label.get("status", name)).casefold()
+                if status in {"double_elixir", "double", "2x"}:
+                    double_elixir = True
+                elif status in {"overtime", "extra_time"}:
+                    overtime = True
+                elif status in {"win", "victory"}:
+                    result = "win"
+                elif status in {"loss", "defeat"}:
+                    result = "loss"
+                elif status in {"draw", "tie"}:
+                    result = "draw"
+                elif status in {"settlement", "results", "result_screen"} and result == "pending":
+                    result = "unknown"
 
-        red_left_tower = zone_score(red_mask, upper_y1, upper_y2, left_x1, left_x2)
-        red_right_tower = zone_score(red_mask, upper_y1, upper_y2, right_x1, right_x2)
-        blue_left_tower = zone_score(blue_mask, lower_y1, lower_y2, left_x1, left_x2)
-        blue_right_tower = zone_score(blue_mask, lower_y1, lower_y2, right_x1, right_x2)
-        red_symmetry = math.sqrt(max(0.0, red_left_tower * red_right_tower))
-        blue_symmetry = math.sqrt(max(0.0, blue_left_tower * blue_right_tower))
-        tower_confidence = math.sqrt(max(0.0, red_symmetry * blue_symmetry))
-
-        arena_confidence = max(0.0, min(1.0, saturation * 1.05 + brightness * 0.20 - 0.22))
-        battle_confidence = max(
-            0.0,
-            min(
-                1.0,
-                0.42 * card_bar_confidence
-                + 0.18 * river_confidence
-                + 0.25 * tower_confidence
-                + 0.15 * arena_confidence,
-            ),
+        semantic_score = (
+            0.34 * min(1.0, sum(card is not None for card in cards) / 4.0)
+            + 0.26 * min(1.0, len(tower_hp) / 6.0)
+            + 0.22 * min(1.0, len(units) / 4.0)
+            + 0.18 * min(1.0, len(detections) / 12.0)
         )
-        if tower_confidence < 0.055 or card_bar_confidence < 0.22:
-            battle_confidence *= 0.35
-        red_density = float(red_mask.mean())
-        phase = float((time.monotonic() % 180.0) / 180.0)
-
-        features = [
-            1.0,
-            elixir / 10.0,
-            left_threat,
-            right_threat,
-            center_threat,
-            deepest,
-            min(1.0, red_density * 35.0),
-            max(-1.0, min(1.0, left_threat - right_threat)),
-            battle_confidence,
-            phase,
-        ]
+        battle_confidence = max(0.0, min(1.0, semantic_score))
+        now = time.monotonic()
+        if self._reset_after_result:
+            self._active_episode_id = None
+            self._reset_after_result = False
+        if battle_confidence >= 0.48:
+            self._last_battle_seen = now
+            if self._active_episode_id is None:
+                self._episode_counter += 1
+                self._active_episode_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{os.getpid()}-{self._episode_counter:06d}"
+        elif self._active_episode_id is not None and now - self._last_battle_seen > 12.0:
+            result = "unknown"
+        done = result in {"win", "loss", "draw"} or (result == "unknown" and self._active_episode_id is not None)
+        episode_id = self._active_episode_id
+        if done:
+            self._reset_after_result = True
+        legal_actions = self._legal_actions(cards, elixir)
+        state = self._state_vector(cards, units, tower_hp, elixir, battle_confidence, match_time, double_elixir, overtime, result, done)
+        card_names = [str(card["label"].get("name", "")) if card is not None else "" for card in cards]
         return {
-            "features": features,
+            "state": state,
+            "legal_actions": legal_actions,
+            "cards": cards,
+            "card_names": card_names,
+            "hand_signature": "|".join(card_names) if all(card_names) else "",
+            "units": units,
+            "tower_hp": tower_hp,
             "elixir": elixir,
-            "left_threat": left_threat,
-            "right_threat": right_threat,
-            "center_threat": center_threat,
-            "deepest": deepest,
+            "match_time": match_time,
+            "double_elixir": double_elixir,
+            "overtime": overtime,
             "battle_confidence": battle_confidence,
-            "blob_count": len(blobs),
+            "vision_ok": battle_confidence >= 0.48,
+            "episode_id": episode_id,
+            "done": done,
+            "result": result,
+            "detections": len(detections),
         }
 
 
+class PolicyValueNetwork:
+    def __init__(self, model: dict[str, Any]) -> None:
+        if not ModelStore.valid(model):
+            raise ValueError("策略价值模型无效")
+        add_vendor_path()
+        import numpy as np
+        self.np = np
+        self.model = model
+        network = model["network"]
+        self.w1 = np.asarray(network["w1"], dtype=np.float32)
+        self.b1 = np.asarray(network["b1"], dtype=np.float32)
+        self.w2 = np.asarray(network["w2"], dtype=np.float32)
+        self.b2 = np.asarray(network["b2"], dtype=np.float32)
+        self.policy_w = np.asarray(network["policy_w"], dtype=np.float32)
+        self.policy_b = np.asarray(network["policy_b"], dtype=np.float32)
+        self.value_w = np.asarray(network["value_w"], dtype=np.float32)
+        self.value_b = np.float32(network["value_b"])
+
+    def forward(self, state: list[float]) -> tuple[Any, float]:
+        np = self.np
+        x = np.asarray(state, dtype=np.float32)
+        if x.shape != (STATE_SIZE,):
+            raise ValueError("状态向量长度错误")
+        h1 = np.maximum(0.0, self.w1 @ x + self.b1)
+        h2 = np.maximum(0.0, self.w2 @ h1 + self.b2)
+        logits = self.policy_w @ h2 + self.policy_b
+        value = float(np.tanh(self.value_w @ h2 + self.value_b))
+        return logits, value
+
+    def choose(self, state: list[float], legal_actions: list[int], exploration: float = 0.0, rng: Optional[random.Random] = None) -> tuple[int, float]:
+        np = self.np
+        scores, value = self.forward(state)
+        legal_mask = np.zeros(ACTION_COUNT, dtype=bool)
+        legal_mask[np.asarray(legal_actions, dtype=np.int64)] = True
+        scores[~legal_mask] = -1e9
+        if exploration > 0.0 and (rng or random).random() < exploration:
+            ranked = np.argsort(scores)[-min(8, len(legal_actions)):]
+            candidates = [int(action) for action in ranked if legal_mask[action]]
+            if candidates:
+                return int((rng or random).choice(candidates)), value
+        return int(np.argmax(scores)), value
+
+
 class Policy:
-    TARGETS = (
-        (0.36, 0.72),
-        (0.64, 0.72),
-        (0.36, 0.60),
-        (0.64, 0.60),
-        (0.40, 0.46),
-        (0.60, 0.46),
-    )
-    CARD_X = (0.285, 0.43, 0.57, 0.715)
-    CARD_Y = 0.91
+    CARD_X = VisionEngine.CARD_X
+    CARD_Y = VisionEngine.CARD_Y
 
-    def __init__(self, model_store: ModelStore, config: dict[str, Any]) -> None:
-        self.model_store = model_store
+    def __init__(self, model: dict[str, Any], config: dict[str, Any]) -> None:
         self.config = config
-        self.model = model_store.load()
         self.rng = random.Random()
+        self.set_model(model)
 
-    @staticmethod
-    def score(weights: list[float], features: list[float]) -> float:
-        return sum(float(weight) * float(feature) for weight, feature in zip(weights, features))
+    def set_model(self, model: dict[str, Any]) -> None:
+        self.model = model
+        self.network = PolicyValueNetwork(model)
+        self.digest = model_weights_digest(model)
 
-    def choose(self, analysis: dict[str, Any]) -> int:
-        features = analysis["features"]
-        elixir = float(analysis["elixir"])
-        costs = [int(value) for value in self.config.get("card_costs", [3, 4, 4, 5])]
-        available_cards = [index for index, cost in enumerate(costs[:4]) if elixir + 0.35 >= cost]
-        if not available_cards:
-            return WAIT_ACTION
+    def choose(self, analysis: dict[str, Any]) -> tuple[int, float]:
+        exploration = max(0.0, min(0.20, float(self.config.get("exploration", 0.0))))
+        return self.network.choose(analysis["state"], analysis["legal_actions"], exploration, self.rng)
 
-        left = float(analysis["left_threat"])
-        right = float(analysis["right_threat"])
-        center = float(analysis["center_threat"])
-        threat = max(left, right, center)
-        if threat > 0.20:
-            preferred_card = min(available_cards, key=lambda index: costs[index])
-            target = 2 if left >= right else 3
-            if center > max(left, right):
-                target = 2 if self.rng.random() < 0.5 else 3
-            return preferred_card * 6 + target
-
-        candidates = [card * 6 + target for card in available_cards for target in range(6)] + [WAIT_ACTION]
-        exploration = max(0.0, min(0.35, float(self.config.get("exploration", 0.04))))
-        if self.rng.random() < exploration:
-            return self.rng.choice(candidates)
-        weights = self.model["weights"]
-        scored = [(self.score(weights[action], features), action) for action in candidates]
-        scored.sort(reverse=True)
-        return scored[0][1]
-
-    def execute(
-        self,
-        control: WindowsControl,
-        hwnd: int,
-        action: int,
-        stop: Optional[threading.Event] = None,
-    ) -> None:
+    def execute(self, control: WindowsControl, hwnd: int, action: int, stop: Optional[threading.Event] = None) -> None:
         if action == WAIT_ACTION or (stop is not None and stop.is_set()):
             return
-        card = action // 6
-        target = action % 6
+        card, column, row = VisionEngine.decode_action(action)
         control.click_normalized(hwnd, self.CARD_X[card], self.CARD_Y)
         if stop is not None:
-            if stop.wait(0.08):
+            if stop.wait(0.07):
                 return
         else:
-            time.sleep(0.08)
-        tx, ty = self.TARGETS[target]
-        if stop is not None and stop.is_set():
-            return
-        control.click_normalized(hwnd, tx, ty)
+            time.sleep(0.07)
+        x, y = VisionEngine.grid_point(column, row)
+        if stop is None or not stop.is_set():
+            control.click_normalized(hwnd, x, y)
+
+
+class NetworkTrainer:
+    def __init__(self, model: dict[str, Any], learning_rate: float) -> None:
+        add_vendor_path()
+        import numpy as np
+        self.np = np
+        self.model = copy.deepcopy(model)
+        self.lr = float(learning_rate)
+        network = self.model["network"]
+        self.params = {
+            "w1": np.asarray(network["w1"], dtype=np.float32),
+            "b1": np.asarray(network["b1"], dtype=np.float32),
+            "w2": np.asarray(network["w2"], dtype=np.float32),
+            "b2": np.asarray(network["b2"], dtype=np.float32),
+            "policy_w": np.asarray(network["policy_w"], dtype=np.float32),
+            "policy_b": np.asarray(network["policy_b"], dtype=np.float32),
+            "value_w": np.asarray(network["value_w"], dtype=np.float32),
+            "value_b": np.asarray(network["value_b"], dtype=np.float32),
+        }
+
+    @staticmethod
+    def _target(item: dict[str, Any]) -> float:
+        if item["result"] == "win":
+            return 1.0
+        if item["result"] == "loss":
+            return -1.0
+        if item["result"] == "draw":
+            return 0.0
+        return max(-1.0, min(1.0, float(item["reward"])))
+
+    def train_epoch(self, samples: list[dict[str, Any]], batch_size: int, behavior_clone_only: bool, rng: random.Random, stop: threading.Event) -> dict[str, float]:
+        np = self.np
+        order = list(range(len(samples)))
+        rng.shuffle(order)
+        policy_loss_total = 0.0
+        value_loss_total = 0.0
+        updates = 0
+        for offset in range(0, len(order), batch_size):
+            if stop.is_set():
+                break
+            batch = [samples[index] for index in order[offset:offset + batch_size]]
+            if behavior_clone_only:
+                batch = [item for item in batch if item["source"] == "human_demo"]
+            if not batch:
+                continue
+            x = np.asarray([item["state"] for item in batch], dtype=np.float32)
+            actions = np.asarray([item["action"] for item in batch], dtype=np.int64)
+            targets = np.asarray([self._target(item) for item in batch], dtype=np.float32)
+            legal = np.zeros((len(batch), ACTION_COUNT), dtype=bool)
+            for index, item in enumerate(batch):
+                legal[index, np.asarray(item["legal_actions"], dtype=np.int64)] = True
+
+            p = self.params
+            z1 = x @ p["w1"].T + p["b1"]
+            h1 = np.maximum(0.0, z1)
+            z2 = h1 @ p["w2"].T + p["b2"]
+            h2 = np.maximum(0.0, z2)
+            logits = h2 @ p["policy_w"].T + p["policy_b"]
+            logits[~legal] = -1e9
+            shifted = logits - logits.max(axis=1, keepdims=True)
+            exp = np.exp(shifted)
+            exp[~legal] = 0.0
+            probs = exp / np.maximum(1e-12, exp.sum(axis=1, keepdims=True))
+            raw_value = h2 @ p["value_w"] + p["value_b"]
+            values = np.tanh(raw_value)
+
+            selected = np.maximum(1e-12, probs[np.arange(len(batch)), actions])
+            sources = [item["source"] for item in batch]
+            coeff = np.asarray([
+                2.0 if source == "human_demo" else float(max(-1.0, min(1.0, targets[index] - values[index])))
+                for index, source in enumerate(sources)
+            ], dtype=np.float32)
+            policy_loss_total += float((-coeff * np.log(selected)).sum())
+            value_loss_total += float(((values - targets) ** 2).sum())
+
+            dlogits = probs.copy()
+            dlogits[np.arange(len(batch)), actions] -= 1.0
+            dlogits *= coeff[:, None] / len(batch)
+            dvalue = (values - targets) * (1.0 - values * values) / len(batch)
+
+            grads: dict[str, Any] = {}
+            grads["policy_w"] = dlogits.T @ h2
+            grads["policy_b"] = dlogits.sum(axis=0)
+            grads["value_w"] = h2.T @ dvalue
+            grads["value_b"] = dvalue.sum()
+            dh2 = dlogits @ p["policy_w"] + dvalue[:, None] * p["value_w"][None, :]
+            dz2 = dh2 * (z2 > 0.0)
+            grads["w2"] = dz2.T @ h1
+            grads["b2"] = dz2.sum(axis=0)
+            dh1 = dz2 @ p["w2"]
+            dz1 = dh1 * (z1 > 0.0)
+            grads["w1"] = dz1.T @ x
+            grads["b1"] = dz1.sum(axis=0)
+
+            norm = math.sqrt(sum(float((gradient * gradient).sum()) for gradient in grads.values()))
+            scale = min(1.0, 5.0 / max(1e-9, norm))
+            for key, gradient in grads.items():
+                p[key] -= self.lr * scale * gradient
+                p[key] = np.clip(p[key], -12.0, 12.0)
+            updates += 1
+        return {
+            "updates": float(updates),
+            "policy_loss": policy_loss_total / max(1, len(samples)),
+            "value_loss": value_loss_total / max(1, len(samples)),
+        }
+
+    def export(self) -> dict[str, Any]:
+        for key, value in self.params.items():
+            self.model["network"][key] = value.tolist() if hasattr(value, "tolist") else float(value)
+        return self.model
+
+
+class PolicyEvaluator:
+    @staticmethod
+    def evaluate(model: dict[str, Any], samples: list[dict[str, Any]]) -> dict[str, Any]:
+        network = PolicyValueNetwork(model)
+        human = [item for item in samples if item["source"] == "human_demo"]
+        correct = 0
+        value_error = 0.0
+        for item in samples:
+            action, value = network.choose(item["state"], item["legal_actions"])
+            if item["source"] == "human_demo" and action == item["action"]:
+                correct += 1
+            target = NetworkTrainer._target(item)
+            value_error += abs(value - target)
+        return {
+            "samples": len(samples),
+            "human_samples": len(human),
+            "human_action_accuracy": round(correct / len(human), 6) if human else 0.0,
+            "value_mae": round(value_error / len(samples), 6) if samples else 1.0,
+        }
+
+
+class PromotionGate:
+    @staticmethod
+    def try_promote(model_store: ModelStore, benchmark_store: BenchmarkStore, config: dict[str, Any]) -> Optional[dict[str, Any]]:
+        candidate = model_store.load_candidate()
+        if candidate is None:
+            return None
+        deck = canonical_deck_signature(parse_deck_signature(str(config.get("benchmark_deck_signature", ""))))
+        cup = str(config.get("benchmark_cup_band", "")).strip()
+        if not deck or not cup:
+            return None
+        official = model_store.load()
+        candidate_digest = model_weights_digest(candidate)
+        official_digest = model_weights_digest(official)
+        arena = CandidateArena.evaluate(benchmark_store, candidate_digest, official_digest, deck, cup)
+        user = UserBenchmark.evaluate(benchmark_store, candidate_digest, deck, cup)
+        if arena["candidate_passed"] and user["candidate_passed"]:
+            evidence = {"arena": arena, "user": user, "evaluated_utc": utc_now()}
+            model_store.promote_candidate(evidence)
+            return evidence
+        return {"arena": arena, "user": user, "promoted": False}
 
 
 class Trainer:
@@ -1832,69 +2681,81 @@ class Trainer:
 
     def run(self, progress: Callable[[str], None], stop: threading.Event) -> dict[str, Any]:
         max_experiences = int(self.config.get("max_experiences", 50000))
-        samples = self.pool.load(max_experiences)
-        model = self.model_store.load()
-        if not samples:
-            if stop.is_set():
-                return {"samples": 0, "generation": model.get("generation", 0), "cancelled": True}
-            progress("经验池为空：保留当前模型")
-            model["updated_utc"] = utc_now()
-            model["benchmark"]["status"] = "unverified"
-            self.model_store.save(model)
-            return {"samples": 0, "generation": model.get("generation", 0), "cancelled": False}
-
-        rng = random.Random(2026 + int(model.get("generation", 0)))
-        weights = [[float(value) for value in row] for row in model["weights"]]
-        epochs = max(1, min(50, int(self.config.get("training_epochs", 5))))
-        learning_rate = max(0.0001, min(0.2, float(self.config.get("training_learning_rate", 0.012))))
-
-        cancelled = False
-        for epoch in range(epochs):
-            if stop.is_set():
-                cancelled = True
-                break
-            rng.shuffle(samples)
-            total_abs_reward = 0.0
-            for sample_index, item in enumerate(samples):
-                if sample_index % 128 == 0 and stop.is_set():
-                    cancelled = True
-                    break
-                features = [max(-2.0, min(2.0, float(value))) for value in item["features"]]
-                action = int(item["action"])
-                reward = max(-1.0, min(1.0, float(item["reward"])))
-                total_abs_reward += abs(reward)
-                prediction = math.tanh(sum(weights[action][i] * features[i] for i in range(FEATURE_COUNT)))
-                error = reward - prediction
-                for index in range(FEATURE_COUNT):
-                    weights[action][index] += learning_rate * error * features[index]
-                    weights[action][index] *= 0.99998
-                    weights[action][index] = max(-8.0, min(8.0, weights[action][index]))
-            if cancelled:
-                break
-            progress(f"模型训练 {epoch + 1}/{epochs}，有效奖励 {total_abs_reward:.2f}")
-
-        if cancelled or stop.is_set():
-            progress("升级已取消，模型保持不变")
+        human_actions, human_episodes = self.pool.episode_counts("human_demo", max_experiences)
+        min_actions = int(self.config.get("min_human_demo_actions", MIN_HUMAN_DEMO_ACTIONS))
+        min_episodes = int(self.config.get("min_human_demo_episodes", MIN_HUMAN_DEMO_EPISODES))
+        official = self.model_store.load()
+        generation = int(official.get("generation", 0))
+        if human_actions < min_actions or human_episodes < min_episodes:
+            progress(f"用户示范不足：需要至少 {min_actions} 次有效出牌且覆盖 {min_episodes} 局；当前 {human_actions} 次 / {human_episodes} 局")
             return {
-                "samples": 0,
-                "generation": model.get("generation", 0),
-                "cancelled": True,
+                "samples": 0, "added": 0, "generation": generation, "cancelled": False,
+                "insufficient_demo": True, "human_actions": human_actions, "human_episodes": human_episodes,
             }
+        validation_fraction = float(self.config.get("training_validation_fraction", 0.20))
+        train, validation = self.pool.split_by_episode(validation_fraction, max_experiences)
+        if not validation:
+            raise RuntimeError("至少需要两局完整经验，才能按对局划分训练集和验证集")
+        train_ids = {item["episode_id"] for item in train}
+        validation_ids = {item["episode_id"] for item in validation}
+        if train_ids & validation_ids:
+            raise RuntimeError("检测到训练集与验证集对局泄漏")
+        progress(f"按整局切分：训练 {len(train)} 条/{len(train_ids)} 局，验证 {len(validation)} 条/{len(validation_ids)} 局")
 
-        model["weights"] = weights
-        model["generation"] = int(model.get("generation", 0)) + 1
-        model["updated_utc"] = utc_now()
-        model["training_samples"] = int(model.get("training_samples", 0)) + len(samples)
-        model["benchmark"] = {
-            "status": "unverified",
-            "note": (
-                "Training completed, but professional-level superiority requires "
-                "external controlled benchmarking."
-            ),
+        learning_rate = float(self.config.get("training_learning_rate", 0.0008))
+        batch_size = int(self.config.get("training_batch_size", 64))
+        trainer = NetworkTrainer(official, learning_rate)
+        rng = random.Random(20260803 + generation)
+        bc_epochs = int(self.config.get("training_epochs_behavior_clone", 8))
+        rl_epochs = int(self.config.get("training_epochs_reinforcement", 4))
+        for epoch in range(bc_epochs):
+            if stop.is_set():
+                return {"samples": 0, "added": 0, "generation": generation, "cancelled": True}
+            metrics = trainer.train_epoch(train, batch_size, True, rng, stop)
+            progress(f"行为克隆 {epoch + 1}/{bc_epochs}｜批次 {int(metrics['updates'])}｜策略损失 {metrics['policy_loss']:.4f}")
+        ai_samples = [item for item in train if item["source"] == "ai_transition"]
+        for epoch in range(rl_epochs):
+            if stop.is_set():
+                return {"samples": 0, "added": 0, "generation": generation, "cancelled": True}
+            if not ai_samples:
+                break
+            metrics = trainer.train_epoch(ai_samples, batch_size, False, rng, stop)
+            progress(f"实战经验训练 {epoch + 1}/{rl_epochs}｜批次 {int(metrics['updates'])}｜价值损失 {metrics['value_loss']:.4f}")
+
+        candidate = trainer.export()
+        candidate["generation"] = generation + 1
+        candidate["updated_utc"] = utc_now()
+        candidate["training"] = {
+            "human_demo_samples": sum(item["source"] == "human_demo" for item in train),
+            "ai_transition_samples": sum(item["source"] == "ai_transition" for item in train),
+            "train_episode_count": len(train_ids),
+            "validation_episode_count": len(validation_ids),
+            "split": "chronological_episode_id",
         }
-        self.model_store.save(model)
+        official_eval = PolicyEvaluator.evaluate(official, validation)
+        candidate_eval = PolicyEvaluator.evaluate(candidate, validation)
+        offline_passed = (
+            candidate_eval["human_action_accuracy"] >= official_eval["human_action_accuracy"]
+            and candidate_eval["value_mae"] <= official_eval["value_mae"] + 0.05
+        )
+        candidate["evaluation"] = {
+            "status": "candidate" if offline_passed else "rejected_offline",
+            "official_validation": official_eval,
+            "candidate_validation": candidate_eval,
+            "note": "候选模型不会覆盖正式模型；还需真实 AI A/B 对局与 UserBenchmark。",
+        }
+        if offline_passed:
+            self.model_store.save(candidate, candidate=True)
+            progress("候选模型已保存；正式模型保持不变，等待真实对局评测")
+        else:
+            progress("候选模型未通过留出对局评测，正式模型保持不变")
         self.pool.compact(max_experiences)
-        return {"samples": len(samples), "generation": model["generation"], "cancelled": False}
+        return {
+            "samples": len(train), "validation_samples": len(validation), "added": 0,
+            "generation": generation + (1 if offline_passed else 0), "cancelled": False,
+            "offline_accuracy": candidate_eval["human_action_accuracy"], "candidate_saved": offline_passed,
+            "official_accuracy": official_eval["human_action_accuracy"],
+        }
 
 
 class GameAI:
@@ -1902,106 +2763,362 @@ class GameAI:
         self.paths = paths
         self.config = config
         self.control = WindowsControl(config)
-        self.vision = VisionEngine()
-        self.model_store = ModelStore(paths.model)
+        self.vision = VisionEngine(config, paths)
+        self.model_store = ModelStore(paths.model, paths.candidate_model, paths.model_archive)
         self.pool = ExperiencePool(paths.experiences)
-        self.policy = Policy(self.model_store, config)
+        self.benchmarks = BenchmarkStore(paths.benchmarks)
+        self.official = self.model_store.load()
+        self.candidate = self.model_store.load_candidate()
+        self.policy = Policy(self.official, config)
+        self.model_role = "official"
+        self.current_episode: Optional[str] = None
+        self.step_id = 0
+        self.episode_first: Optional[dict[str, Any]] = None
+        self.vision_failed = False
+        self.observed_cards: set[str] = set()
+        self._benchmarked: set[str] = set()
 
     @staticmethod
-    def reward(previous: dict[str, Any], current: dict[str, Any], action: int) -> float:
-        previous_threat = previous["left_threat"] + previous["right_threat"] + previous["center_threat"]
-        current_threat = current["left_threat"] + current["right_threat"] + current["center_threat"]
-        defensive_gain = previous_threat - current_threat
-        activity = 0.02 if action != WAIT_ACTION else -0.01
-        confidence_penalty = -0.08 if current["battle_confidence"] < 0.30 else 0.0
-        return max(-1.0, min(1.0, defensive_gain + activity + confidence_penalty))
+    def transition_reward(previous: dict[str, Any], current: dict[str, Any], action: int) -> float:
+        previous_enemy = sum(previous["state"][25:28])
+        current_enemy = sum(current["state"][25:28])
+        previous_friendly = sum(previous["state"][22:25])
+        current_friendly = sum(current["state"][22:25])
+        reward = (previous_enemy - current_enemy) - (previous_friendly - current_friendly)
+        if action != WAIT_ACTION:
+            reward += 0.005
+        if current["result"] == "win":
+            reward += 1.0
+        elif current["result"] == "loss":
+            reward -= 1.0
+        return max(-2.0, min(2.0, reward))
+
+    def _select_model(self, episode_id: str) -> None:
+        self.official = self.model_store.load()
+        self.candidate = self.model_store.load_candidate()
+        use_candidate = False
+        if self.candidate is not None:
+            deck = canonical_deck_signature(parse_deck_signature(str(self.config.get("benchmark_deck_signature", ""))))
+            cup = str(self.config.get("benchmark_cup_band", "")).strip()
+            records = [item for item in self.benchmarks.load() if item.get("actor") == "ai" and item.get("deck_signature") == deck and item.get("cup_band") == cup]
+            candidate_digest = model_weights_digest(self.candidate)
+            official_digest = model_weights_digest(self.official)
+            candidate_count = sum(item.get("model_sha256") == candidate_digest for item in records)
+            official_count = sum(item.get("model_sha256") == official_digest for item in records)
+            use_candidate = candidate_count <= official_count
+        model = self.candidate if use_candidate else self.official
+        assert model is not None
+        self.model_role = "candidate" if use_candidate else "official"
+        self.policy.set_model(model)
+
+    def _benchmark_episode(self, analysis: dict[str, Any], disconnected: bool = False) -> None:
+        episode_id = str(analysis.get("episode_id") or self.current_episode or "")
+        if not episode_id or episode_id in self._benchmarked:
+            return
+        self._benchmarked.add(episode_id)
+        towers = analysis.get("tower_hp") if isinstance(analysis.get("tower_hp"), dict) else {}
+        friendly = [float(towers.get(key, 0.0)) for key in ("friendly_left", "friendly_right", "friendly_king")]
+        enemy = [float(towers.get(key, 0.0)) for key in ("enemy_left", "enemy_right", "enemy_king")]
+        crown_diff = sum(value <= 0.02 for value in enemy) - sum(value <= 0.02 for value in friendly)
+        expected_deck = parse_deck_signature(str(self.config.get("benchmark_deck_signature", "")))
+        deck = canonical_deck_signature(expected_deck)
+        observed_deck = canonical_deck_signature(self.observed_cards)
+        deck_verified = len(expected_deck) == 8 and observed_deck == deck
+        cup = str(self.config.get("benchmark_cup_band", "")).strip()
+        result = str(analysis.get("result", "unknown"))
+        valid = bool(deck_verified and cup and result in {"win", "loss", "draw"} and not disconnected and not self.vision_failed)
+        if valid:
+            reason = ""
+        elif not deck or not cup:
+            reason = "未配置固定八卡卡组/杯段"
+        elif not deck_verified:
+            reason = "检测到的八卡卡组与基准配置不一致或不完整"
+        else:
+            reason = "掉线、识别失败或缺少结算结果"
+        self.benchmarks.append({
+            "episode_id": episode_id,
+            "actor": "ai",
+            "model_sha256": self.policy.digest,
+            "model_role": self.model_role,
+            "deck_signature": deck,
+            "cup_band": cup,
+            "valid": valid,
+            "exclusion_reason": reason,
+            "result": result if result in {"win", "loss", "draw"} else "unknown",
+            "crown_diff": crown_diff,
+            "tower_hp_diff": sum(friendly) - sum(enemy),
+            "vision_failure": self.vision_failed,
+            "disconnected": disconnected,
+        })
+        PromotionGate.try_promote(self.model_store, self.benchmarks, self.config)
 
     def run(self, progress: Callable[[str], None], stop: threading.Event) -> None:
         hwnd = self.control.launch_or_find(progress, stop)
         if hwnd is None:
-            raise RuntimeError("未找到 Clash Royale 窗口；请先安装并登录可在 Windows 运行的游戏环境")
+            raise RuntimeError("未找到 Clash Royale 窗口；请先安装并登录游戏环境")
         self.control.focus(hwnd)
-        progress("AI 已接管游戏窗口；按 ESC 立即停止")
-        interval = max(0.55, min(3.0, float(self.config.get("decision_interval_seconds", 1.25))))
-        previous_analysis: Optional[dict[str, Any]] = None
+        candidate_text = "存在候选模型，将与正式模型交替进行真实 A/B 对局" if self.candidate is not None else "当前仅运行正式模型"
+        progress(f"AI 已接管游戏窗口；{candidate_text}；按 ESC 立即停止")
+        interval = max(0.35, min(3.0, float(self.config.get("decision_interval_seconds", 0.85))))
+        previous: Optional[dict[str, Any]] = None
         previous_action = WAIT_ACTION
-        previous_features: Optional[list[float]] = None
         last_status = 0.0
         last_lobby_click = 0.0
         low_confidence_frames = 0
         lobby_cooldown = max(4.0, min(30.0, float(self.config.get("lobby_click_cooldown_seconds", 8.0))))
+        try:
+            while not stop.is_set():
+                started = time.monotonic()
+                current_hwnd = self.control.find_game_window()
+                if current_hwnd is None:
+                    if self.current_episode:
+                        self._benchmark_episode(previous or {"episode_id": self.current_episode, "result": "unknown", "tower_hp": {}}, disconnected=True)
+                    raise RuntimeError("游戏窗口已关闭")
+                hwnd = current_hwnd
+                frame = self.vision.capture(self.control.rect(hwnd))
+                analysis = self.vision.analyze(frame)
+                episode_id = analysis.get("episode_id")
+                if episode_id and episode_id != self.current_episode:
+                    self.current_episode = str(episode_id)
+                    self.step_id = 0
+                    self.episode_first = analysis
+                    self.vision_failed = False
+                    self.observed_cards = set()
+                    previous = None
+                    self._select_model(self.current_episode)
+                if self.current_episode and not analysis.get("vision_ok", False):
+                    self.vision_failed = True
+                if self.current_episode:
+                    self.observed_cards.update(str(name).strip().casefold() for name in analysis.get("card_names", []) if str(name).strip())
 
-        while not stop.is_set():
-            started = time.monotonic()
-            current_hwnd = self.control.find_game_window()
-            if current_hwnd is None:
-                raise RuntimeError("游戏窗口已关闭")
-            hwnd = current_hwnd
-            rect = self.control.rect(hwnd)
-            frame = self.vision.capture(rect)
-            analysis = self.vision.analyze(frame)
+                if previous is not None and previous.get("episode_id") == analysis.get("episode_id"):
+                    self.pool.append_transition({
+                        "schema": EXPERIENCE_SCHEMA,
+                        "episode_id": self.current_episode,
+                        "step_id": self.step_id,
+                        "state": previous["state"],
+                        "legal_actions": previous["legal_actions"],
+                        "action": previous_action,
+                        "reward": self.transition_reward(previous, analysis, previous_action),
+                        "next_state": analysis["state"],
+                        "done": bool(analysis["done"]),
+                        "result": analysis["result"] if analysis["done"] else "pending",
+                        "source": "ai_transition",
+                        "meta": {"model_sha256": self.policy.digest, "model_role": self.model_role, "battle_confidence": analysis["battle_confidence"]},
+                    })
+                    self.step_id += 1
 
-            if (
-                previous_analysis is not None
-                and previous_features is not None
-                and previous_analysis["battle_confidence"] >= 0.52
-                and analysis["battle_confidence"] >= 0.40
-            ):
-                reward = self.reward(previous_analysis, analysis, previous_action)
-                self.pool.append(
-                    previous_features,
-                    previous_action,
-                    reward,
-                    {
-                        "battle_confidence": round(float(analysis["battle_confidence"]), 4),
-                        "blob_count": int(analysis["blob_count"]),
-                    },
-                )
-
-            queued = False
-            if analysis["battle_confidence"] < 0.52:
-                action = WAIT_ACTION
-                low_confidence_frames += 1
-                now = time.monotonic()
-                if (
-                    bool(self.config.get("auto_queue_battle", True))
-                    and low_confidence_frames >= 3
-                    and now - last_lobby_click >= lobby_cooldown
-                    and not stop.is_set()
-                ):
-                    lobby_action = self.vision.find_lobby_action(frame)
-                    if lobby_action is not None and lobby_action[2] >= 0.68:
-                        self.control.focus(hwnd)
-                        self.control.click_normalized(hwnd, lobby_action[0], lobby_action[1])
-                        last_lobby_click = now
-                        low_confidence_frames = 0
-                        queued = True
-                        previous_analysis = None
-                        previous_features = None
-            else:
-                low_confidence_frames = 0
-                action = self.policy.choose(analysis)
-                if not stop.is_set():
+                queued = False
+                value = 0.0
+                if analysis["done"]:
+                    action = WAIT_ACTION
+                    self._benchmark_episode(analysis)
+                    previous = None
+                    self.current_episode = None
+                elif analysis["battle_confidence"] < 0.48 or not episode_id:
+                    action = WAIT_ACTION
+                    low_confidence_frames += 1
+                    now = time.monotonic()
+                    if bool(self.config.get("auto_queue_battle", True)) and low_confidence_frames >= 3 and now - last_lobby_click >= lobby_cooldown:
+                        lobby = self.vision.find_lobby_action(frame)
+                        if lobby is not None and lobby[2] >= 0.68 and not stop.is_set():
+                            self.control.focus(hwnd)
+                            self.control.click_normalized(hwnd, lobby[0], lobby[1])
+                            last_lobby_click = now
+                            low_confidence_frames = 0
+                            queued = True
+                else:
+                    low_confidence_frames = 0
+                    action, value = self.policy.choose(analysis)
                     self.policy.execute(self.control, hwnd, action, stop)
 
-            if not queued:
-                previous_analysis = analysis
-                previous_features = list(analysis["features"])
-                previous_action = action
+                if not queued and episode_id and not analysis["done"]:
+                    previous = analysis
+                    previous_action = action
+                now = time.monotonic()
+                if now - last_status >= 1.8:
+                    last_status = now
+                    if action == WAIT_ACTION:
+                        action_text = "等待"
+                    else:
+                        card, column, row = VisionEngine.decode_action(action)
+                        action_text = f"卡槽 {card + 1} / 网格 ({column + 1},{row + 1})"
+                    progress(f"AI运行中｜{self.model_role}｜圣水≈{analysis['elixir']:.1f}｜价值 {value:+.2f}｜{action_text}")
+                stop.wait(max(0.03, interval - (time.monotonic() - started)))
+        finally:
+            if self.current_episode and previous is not None:
+                self._benchmark_episode(previous, disconnected=True)
 
-            now = time.monotonic()
-            if now - last_status > 1.8:
-                last_status = now
-                if queued:
-                    action_text = "尝试进入下一场对战"
-                else:
-                    action_text = "等待" if action == WAIT_ACTION else f"卡位 {action // 6 + 1} / 目标 {action % 6 + 1}"
-                progress(
-                    f"AI运行中｜圣水≈{analysis['elixir']:.1f}｜威胁 L {analysis['left_threat']:.2f} "
-                    f"R {analysis['right_threat']:.2f}｜{action_text}"
-                )
-            elapsed = time.monotonic() - started
-            stop.wait(max(0.03, interval - elapsed))
+
+class HumanDemonstrationRecorder:
+    VK_LBUTTON = 0x01
+
+    def __init__(self, control: WindowsControl, vision: VisionEngine, pool: ExperiencePool, benchmarks: BenchmarkStore, config: dict[str, Any]) -> None:
+        self.control = control
+        self.vision = vision
+        self.pool = pool
+        self.benchmarks = benchmarks
+        self.config = config
+        self._was_down = False
+        self._selected_card: Optional[int] = None
+        self._selected_state: Optional[list[float]] = None
+        self._selected_legal: Optional[list[int]] = None
+        self._selected_episode: Optional[str] = None
+        self._selected_at = 0.0
+        self._pending: Optional[dict[str, Any]] = None
+        self._step_id = 0
+        self._benchmarked: set[str] = set()
+        self._vision_failed = False
+        self._observed_cards: set[str] = set()
+        self._active_episode: Optional[str] = None
+        self.recorded = 0
+
+    @staticmethod
+    def _cursor_normalized(rect: tuple[int, int, int, int]) -> Optional[tuple[float, float]]:
+        if os.name != "nt":
+            return None
+        point = wintypes.POINT()
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        left, top, right, bottom = rect
+        if right <= left or bottom <= top:
+            return None
+        x, y = (point.x - left) / (right - left), (point.y - top) / (bottom - top)
+        return (float(x), float(y)) if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 else None
+
+    @staticmethod
+    def _nearest(values: tuple[float, ...], value: float) -> tuple[int, float]:
+        index = min(range(len(values)), key=lambda item: abs(values[item] - value))
+        return index, abs(values[index] - value)
+
+    def _flush_pending(self, analysis: dict[str, Any]) -> None:
+        if self._pending is None:
+            return
+        if self._pending["episode_id"] != analysis.get("episode_id") and not analysis.get("done"):
+            self._pending = None
+            return
+        if time.monotonic() - self._pending["created"] < 0.12 and not analysis.get("done"):
+            return
+        result = analysis["result"] if analysis.get("done") else "pending"
+        reward = 1.0 if result == "win" else (-1.0 if result == "loss" else 0.0)
+        self.pool.append_transition({
+            "schema": EXPERIENCE_SCHEMA,
+            "episode_id": self._pending["episode_id"],
+            "step_id": self._step_id,
+            "state": self._pending["state"],
+            "legal_actions": self._pending["legal_actions"],
+            "action": self._pending["action"],
+            "reward": reward,
+            "next_state": analysis["state"],
+            "done": bool(analysis.get("done")),
+            "result": result,
+            "source": "human_demo",
+            "meta": {"battle_confidence": analysis["battle_confidence"], "hand_signature": analysis.get("hand_signature", "")},
+        })
+        self.recorded += 1
+        self._step_id += 1
+        self._pending = None
+
+    def _benchmark_episode(self, analysis: dict[str, Any], disconnected: bool = False) -> None:
+        episode_id = str(analysis.get("episode_id") or "")
+        if not episode_id or episode_id in self._benchmarked:
+            return
+        self._benchmarked.add(episode_id)
+        towers = analysis.get("tower_hp") if isinstance(analysis.get("tower_hp"), dict) else {}
+        friendly = [float(towers.get(key, 0.0)) for key in ("friendly_left", "friendly_right", "friendly_king")]
+        enemy = [float(towers.get(key, 0.0)) for key in ("enemy_left", "enemy_right", "enemy_king")]
+        expected_deck = parse_deck_signature(str(self.config.get("benchmark_deck_signature", "")))
+        deck = canonical_deck_signature(expected_deck)
+        observed_deck = canonical_deck_signature(self._observed_cards)
+        deck_verified = len(expected_deck) == 8 and observed_deck == deck
+        cup = str(self.config.get("benchmark_cup_band", "")).strip()
+        result = str(analysis.get("result", "unknown"))
+        valid = bool(deck_verified and cup and result in {"win", "loss", "draw"} and not self._vision_failed and not disconnected)
+        self.benchmarks.append({
+            "episode_id": episode_id, "actor": "human", "model_sha256": "", "model_role": "human",
+            "deck_signature": deck, "cup_band": cup, "valid": valid,
+            "exclusion_reason": "" if valid else "固定八卡卡组/杯段不匹配、识别失败、掉线或缺少结算结果",
+            "result": result if result in {"win", "loss", "draw"} else "unknown",
+            "crown_diff": sum(value <= 0.02 for value in enemy) - sum(value <= 0.02 for value in friendly),
+            "tower_hp_diff": sum(friendly) - sum(enemy),
+            "vision_failure": self._vision_failed, "disconnected": disconnected,
+        })
+        self._vision_failed = False
+        self._observed_cards = set()
+        self._active_episode = None
+        self._step_id = 0
+
+    def finalize_interrupted(self, analysis: Optional[dict[str, Any]]) -> None:
+        if analysis is None:
+            return
+        if self._pending is not None:
+            terminal = dict(analysis)
+            terminal["done"] = True
+            terminal["result"] = "unknown"
+            self._flush_pending(terminal)
+        if analysis.get("episode_id"):
+            interrupted = dict(analysis)
+            interrupted["result"] = "unknown"
+            self._benchmark_episode(interrupted, disconnected=True)
+
+    def poll(self, hwnd: int, analysis: dict[str, Any]) -> bool:
+        episode_id = str(analysis.get("episode_id") or "")
+        if episode_id and episode_id != self._active_episode:
+            self._active_episode = episode_id
+            self._observed_cards = set()
+            self._vision_failed = False
+            self._step_id = 0
+        if episode_id:
+            self._observed_cards.update(str(name).strip().casefold() for name in analysis.get("card_names", []) if str(name).strip())
+        self._flush_pending(analysis)
+        if analysis.get("done"):
+            self._benchmark_episode(analysis)
+            self._selected_card = None
+            return False
+        if os.name != "nt" or analysis.get("battle_confidence", 0.0) < 0.48 or not analysis.get("episode_id"):
+            if analysis.get("episode_id"):
+                self._vision_failed = True
+            self._selected_card = None
+            return False
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(self.VK_LBUTTON) & 0x8000)
+        clicked = down and not self._was_down
+        self._was_down = down
+        if not clicked:
+            return False
+        cursor = self._cursor_normalized(self.control.rect(hwnd))
+        if cursor is None:
+            return False
+        x, y = cursor
+        now = time.monotonic()
+        card, distance = self._nearest(Policy.CARD_X, x)
+        if y >= 0.82 and distance <= 0.075:
+            self._selected_card = card
+            self._selected_state = list(analysis["state"])
+            self._selected_legal = list(analysis["legal_actions"])
+            self._selected_episode = str(analysis["episode_id"])
+            self._selected_at = now
+            return False
+        if self._selected_card is None or self._selected_state is None or self._selected_legal is None or now - self._selected_at > 2.5:
+            return False
+        cell = VisionEngine.point_to_cell(x, y)
+        if cell is None:
+            return False
+        column, row = cell
+        action = VisionEngine.encode_action(self._selected_card, column, row)
+        if action not in self._selected_legal:
+            self._selected_card = None
+            return False
+        self._pending = {
+            "episode_id": self._selected_episode,
+            "state": self._selected_state,
+            "legal_actions": self._selected_legal,
+            "action": action,
+            "created": now,
+        }
+        self._selected_card = None
+        self._selected_state = None
+        self._selected_legal = None
+        return True
 
 
 class GlobalEscapeWatcher:
@@ -2068,7 +3185,7 @@ class ClashRoyaleApp:
         title.pack(pady=(38, 6))
         subtitle = tk.Label(
             self.root,
-            text="Windows 11 x64 · Python 3.12.10",
+            text="Windows 11 x64 · Python 3.12.x",
             bg="#0b1220",
             fg="#94a3b8",
             font=("Microsoft YaHei UI", 11),
@@ -2227,16 +3344,41 @@ class ClashRoyaleApp:
         token = self.set_mode("human", "人模式", "正在打开游戏")
 
         def task() -> None:
-            config = self.config_store.load()
+            config = self.integrity.quick_ready(lambda text: self.post("status", token, text), self.mode_stop)
+            if self.mode_stop.is_set():
+                return
             control = WindowsControl(config)
             hwnd = control.launch_or_find(lambda text: self.post("status", token, text), self.mode_stop)
             if hwnd is None:
                 raise RuntimeError("未找到 Clash Royale 窗口或启动入口")
             control.focus(hwnd)
-            self.post("status", token, "游戏窗口已激活；由玩家操作，按 ESC 返回控制台")
-            while not self.mode_stop.wait(0.5):
-                if control.find_game_window() is None:
-                    raise RuntimeError("游戏窗口已关闭")
+            vision = VisionEngine(config, self.paths)
+            recorder = HumanDemonstrationRecorder(
+                control,
+                vision,
+                ExperiencePool(self.paths.experiences),
+                BenchmarkStore(self.paths.benchmarks),
+                config,
+            )
+            self.post("status", token, "游戏窗口已激活；玩家操作会被记录为示范经验，按 ESC 返回控制台")
+            last_status = 0.0
+            last_analysis: Optional[dict[str, Any]] = None
+            try:
+                while not self.mode_stop.is_set():
+                    current_hwnd = control.find_game_window()
+                    if current_hwnd is None:
+                        raise RuntimeError("游戏窗口已关闭")
+                    frame = vision.capture(control.rect(current_hwnd))
+                    analysis = vision.analyze(frame)
+                    last_analysis = analysis
+                    recorder.poll(current_hwnd, analysis)
+                    now = time.monotonic()
+                    if now - last_status >= 2.0:
+                        last_status = now
+                        self.post("status", token, f"玩家示范记录中｜已记录 {recorder.recorded} 次有效出牌")
+                    self.mode_stop.wait(0.05)
+            finally:
+                recorder.finalize_interrupted(last_analysis)
 
         self.worker(token, task)
 
@@ -2247,14 +3389,27 @@ class ClashRoyaleApp:
             config = self.integrity.quick_ready(lambda text: self.post("status", token, text), self.mode_stop)
             if self.mode_stop.is_set():
                 return
-            trainer = Trainer(ModelStore(self.paths.model), ExperiencePool(self.paths.experiences), config)
+            trainer = Trainer(
+                ModelStore(self.paths.model, self.paths.candidate_model, self.paths.model_archive),
+                ExperiencePool(self.paths.experiences),
+                config,
+            )
             result = trainer.run(lambda text: self.post("status", token, text), self.mode_stop)
             if self.mode_stop.is_set() or result.get("cancelled"):
                 return
+            if result.get("insufficient_demo"):
+                self.post(
+                    "done",
+                    token,
+                    f"示范不足：当前 {result.get('human_actions', 0)} 次有效出牌 / {result.get('human_episodes', 0)} 局；继续使用“人”模式采集",
+                )
+                return
+            accuracy = float(result.get("offline_accuracy", 0.0)) * 100.0
+            status = "候选模型已生成，等待真实评测" if result.get("candidate_saved") else "候选模型未通过留出对局评测"
             self.post(
                 "done",
                 token,
-                f"升级完成：第 {result['generation']} 代模型，使用 {result['samples']} 条经验",
+                f"升级完成：训练 {result['samples']} 条，验证 {result.get('validation_samples', 0)} 条，动作准确率 {accuracy:.1f}%｜{status}",
             )
 
         self.worker(token, task)
