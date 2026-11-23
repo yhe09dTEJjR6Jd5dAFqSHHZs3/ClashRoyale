@@ -1,10 +1,10 @@
-可在任意Windows 11 x64设备上高效运行。
+只用一个压缩包，在任意一台已安装Python 3.15和安卓模拟器的Windows 11 x64设备上，实现一个玩皇室战争的超级智能体
+
+解压→运行ClashRoyale.exe→用户选择文件夹→一切就绪
+
+
 
 所有东西应尽可能存放在桌面上的ClashRoyale文件夹中。
-
-Python：3.12
-
-初始状态下，用户仅拥有ClashRoyale.py。
 
 ClashRoyale.py不得包含与实际运行无关的内容。
 
